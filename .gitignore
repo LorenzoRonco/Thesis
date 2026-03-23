@@ -1,0 +1,43 @@
+# Dataset e Video
+dataset/
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.flv
+
+# Output di processing
+segmented/
+analysis/
+logs/
+*.log
+
+# Python cache e ambiente
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Stato processing (generato)
+processing_state.json
+config_current.json
