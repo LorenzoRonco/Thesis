@@ -23,11 +23,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Pose landmarks: only upper body (0-10), excluding legs (11-32)
-# 0-3: nose, eyes, ears
-# 4-5: left shoulder, elbow, wrist
-# 6-10: right shoulder, elbow, wrist
-POSE_LANDMARKS = 11
+# Pose landmarks: upper body with arms (0-16), excluding legs (17-32)
+# 0: nose
+# 1-6: eyes and ears
+# 7-8: mouth
+# 9-10: left shoulder/elbow/wrist
+# 11-16: right shoulder/elbow/wrist + middle area
+# This includes shoulders, elbows, and wrists (indices 12-16)
+POSE_LANDMARKS = 17
 LEFT_HAND_LANDMARKS = 21
 RIGHT_HAND_LANDMARKS = 21
 FACE_LANDMARKS = 468

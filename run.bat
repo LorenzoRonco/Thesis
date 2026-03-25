@@ -81,8 +81,17 @@ goto end
 :visualize
 echo.
 echo Visualizzazione video con landmark MediaPipe...
-echo.
-python scripts/visualize_landmarks.py
+REM Seleziona un video a caso da dataset/segmented/
+for /F "delims=" %%f in ('powershell -Command "Get-ChildItem dataset\segmented\*.mp4 | Get-Random | Select-Object -ExpandProperty Name"') do set RANDOM_VIDEO=%%f
+
+if defined RANDOM_VIDEO (
+    echo Video selezionato: !RANDOM_VIDEO!
+    python scripts/visualize_landmarks.py dataset\segmented\!RANDOM_VIDEO! --output output_video.mp4
+    echo.
+    echo Video generato: output_video.mp4
+) else (
+    echo Errore: nessun video trovato in dataset/segmented/
+)
 pause
 goto end
 

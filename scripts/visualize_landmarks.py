@@ -9,12 +9,17 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# Landmark connection indices for MediaPipe upper body (0-10)
+# Landmark connection indices for MediaPipe upper body (0-16)
+# Now includes arms: shoulders (11-12), elbows (13-14), wrists (15-16)
 POSE_CONNECTIONS = frozenset([
-    (0, 1), (0, 2), (0, 3), (0, 4),  # Head connections (nose to eyes/ears)
-    (5, 7), (7, 9),  # Left arm: shoulder -> elbow -> wrist
-    (6, 8), (8, 10),  # Right arm: shoulder -> elbow -> wrist
-    (5, 6),  # Shoulders connection
+    (0, 1), (0, 2), (0, 3), (0, 4),  # Nose to eyes/ears
+    (1, 3), (2, 4),                   # Eyes to ears
+    # Left arm: shoulder -> elbow -> wrist
+    (11, 13), (13, 15),
+    # Right arm: shoulder -> elbow -> wrist  
+    (12, 14), (14, 16),
+    # Shoulders connection
+    (11, 12),
 ])
 
 HAND_CONNECTIONS = frozenset([
@@ -41,14 +46,41 @@ COLORS = {
 LANDMARK_RADIUS = 4
 CONNECTION_THICKNESS = 2
 
-# Landmark structure
-POSE_LANDMARKS = 11
+# POSE_LANDMARKS includes shoulders (11-12), elbows (13-14), wrists (15-16)
+POSE_LANDMARKS = 17
 LEFT_HAND_LANDMARKS = 21
 RIGHT_HAND_LANDMARKS = 21
 FACE_LANDMARKS = 468
 POSE_END = POSE_LANDMARKS
 LEFT_HAND_END = POSE_END + LEFT_HAND_LANDMARKS
 RIGHT_HAND_END = LEFT_HAND_END + RIGHT_HAND_LANDMARKS
+
+
+def find_video_file(video_path):
+    """Find video file, handling partial naming patterns."""
+    video_path = Path(video_path)
+    
+    # If file exists as-is, return it
+    if video_path.exists():
+        return video_path
+    
+    # If it's just a filename, search in dataset/segmented/
+    if not video_path.is_absolute():
+        root_dir = Path(__file__).parent.parent
+        segmented_dir = root_dir / "dataset" / "segmented"
+        
+        # Try exact match
+        full_path = segmented_dir / video_path.name
+        if full_path.exists():
+            return full_path
+        
+        # Try with wildcard pattern (handles SENTENCE_ID_SENTENCE_NAME pattern)
+        stem = video_path.stem
+        matches = list(segmented_dir.glob(f"*_{stem}.mp4"))
+        if matches:
+            return matches[0]
+    
+    return None
 
 
 def find_landmarks_file(video_path):
@@ -65,10 +97,16 @@ def find_landmarks_file(video_path):
     if npy_file.exists():
         return npy_file
     
-    # Try to find file with similar name
+    # Try with underscore prefix pattern (SENTENCE_ID_SENTENCE_NAME_landmarks.npy)
     if landmarks_dir.exists():
-        for npy in landmarks_dir.glob(f"{video_name}*.npy"):
+        for npy in landmarks_dir.glob(f"*_{video_name}_landmarks.npy"):
             return npy
+    
+    # Try any fuzzy match as fallback
+    if landmarks_dir.exists():
+        for npy in landmarks_dir.glob(f"*{video_name}*.npy"):
+            if npy.name.endswith("_landmarks.npy"):
+                return npy
     
     return None
 
@@ -251,7 +289,10 @@ def main():
     
     # Find video to process
     if args.video:
-        video_path = Path(args.video)
+        video_path = find_video_file(args.video)
+        if not video_path:
+            print(f"ERROR: Cannot find video: {args.video}")
+            return
     else:
         # Use first video in dataset/segmented/
         root_dir = Path(__file__).parent.parent
