@@ -17,17 +17,19 @@ echo 2. Diagnosi (verifica setup)
 echo 3. Test Segmentazione (2 video)
 echo 4. Segmentazione COMPLETA (tutti i video)
 echo 5. Estrazione Landmark (MediaPipe Holistic)
-echo 6. Esci
+echo 6. Visualizza Landmark Video
+echo 7. Esci
 echo.
 
-set /p choice="Inserisci il numero (1-6): "
+set /p choice="Inserisci il numero (1-7): "
 
 if "%choice%"=="1" goto setup
 if "%choice%"=="2" goto diagnose
 if "%choice%"=="3" goto test
 if "%choice%"=="4" goto full
 if "%choice%"=="5" goto landmarks
-if "%choice%"=="6" goto end
+if "%choice%"=="6" goto visualize
+if "%choice%"=="7" goto end
 
 echo Scelta non valida
 goto end
@@ -73,6 +75,14 @@ echo Estrazione landmark dai video segmentati...
 echo (MediaPipe Holistic: Pose + Mani + Viso)
 echo.
 python src/preprocessing/landmark_extraction.py
+pause
+goto end
+
+:visualize
+echo.
+echo Visualizzazione video con landmark MediaPipe...
+echo.
+python scripts/visualize_landmarks.py
 pause
 goto end
 

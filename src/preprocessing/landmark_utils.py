@@ -10,7 +10,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Landmark structure
-POSE_LANDMARKS = 33
+# Pose: only upper body (0-10), excluding legs (11-32)
+POSE_LANDMARKS = 11
 LEFT_HAND_LANDMARKS = 21
 RIGHT_HAND_LANDMARKS = 21
 FACE_LANDMARKS = 468

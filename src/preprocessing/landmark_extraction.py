@@ -23,7 +23,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-POSE_LANDMARKS = 33
+# Pose landmarks: only upper body (0-10), excluding legs (11-32)
+# 0-3: nose, eyes, ears
+# 4-5: left shoulder, elbow, wrist
+# 6-10: right shoulder, elbow, wrist
+POSE_LANDMARKS = 11
 LEFT_HAND_LANDMARKS = 21
 RIGHT_HAND_LANDMARKS = 21
 FACE_LANDMARKS = 468
@@ -183,13 +187,15 @@ class LandmarkExtractor:
         
         Returns:
             numpy array of shape (num_landmarks, 4) with [x, y, z, confidence]
-            Total landmarks: 33 (pose) + 21 (left_hand) + 21 (right_hand) + 468 (face) = 543
+            Total landmarks: 11 (pose upper body only) + 21 (left_hand) + 21 (right_hand) + 468 (face) = 521
         """
         landmarks = []
         
-        # Pose landmarks (33 points)
+        # Pose landmarks - upper body only (11 points: indices 0-10)
+        # Excludes legs and lower body (indices 11-32)
         pose = self._as_landmark_list(results.pose_landmarks)
-        landmarks.extend(self._extract_points(pose, POSE_LANDMARKS, "visibility"))
+        pose_upper = pose[:POSE_LANDMARKS]  # Take only first 11 (upper body)
+        landmarks.extend(self._extract_points(pose_upper, POSE_LANDMARKS, "visibility"))
 
         # Left hand landmarks (21 points)
         left_hand = self._as_landmark_list(results.left_hand_landmarks)
