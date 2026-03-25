@@ -41,3 +41,7 @@ Thumbs.db
 # Stato processing (generato)
 processing_state.json
 config_current.json
+
+
+# report
+video_integrity_report.txt
