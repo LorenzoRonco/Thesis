@@ -12,35 +12,34 @@ logger = logging.getLogger(__name__)
 
 
 def check_dependencies():
-    """Verifica che tutte le dipendenze siano installate."""
-    print("Verifica dipendenze...\n")
+    """Verifica e installa tutte le dipendenze da requirements.txt."""
+    print("Installazione dipendenze da requirements.txt...\n")
     
-    dependencies = {
-        'pandas': 'pandas',
-        'numpy': 'numpy',
-        'cv2': 'opencv-python'  # Opzionale ma utile
-    }
+    root_dir = Path(__file__).parent.parent  # Sali 2 livelli: scripts -> root
+    requirements_file = root_dir / "requirements.txt"
     
-    missing = []
+    if not requirements_file.exists():
+        print(f"❌ File requirements.txt non trovato: {requirements_file}")
+        return False
     
-    for module_name, package_name in dependencies.items():
-        try:
-            __import__(module_name if module_name != 'cv2' else 'cv2')
-            print(f"✓ {package_name}")
-        except ImportError:
-            print(f"✗ {package_name} (MANCANTE)")
-            missing.append(package_name)
-    
-    if missing:
-        print(f"\nInstallazione pacchetti mancanti...")
-        for package in missing:
-            try:
-                subprocess.check_call([sys.executable, '-m', 'pip', 'install', package])
-            except subprocess.CalledProcessError as e:
-                print(f"⚠️  Errore nell'installazione di {package}: {e}")
-        print("✓ Pacchetti installati (con eventuali errori sopra)")
-    else:
-        print("\n✓ Tutte le dipendenze Python presenti")
+    try:
+        # Installa da requirements.txt
+        print(f"Leggo da: {requirements_file}")
+        result = subprocess.run(
+            [sys.executable, '-m', 'pip', 'install', '-r', str(requirements_file)],
+            capture_output=False
+        )
+        
+        if result.returncode == 0:
+            print("\n✓ Tutte le dipendenze installate con successo!")
+            return True
+        else:
+            print(f"\n⚠️  Errore durante l'installazione (exit code: {result.returncode})")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Errore: {e}")
+        return False
     
     # Verifica ffmpeg separatamente
     print("\nVerifica ffmpeg (sistema)...")

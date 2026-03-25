@@ -251,7 +251,7 @@ def main():
     # Configurazione percorsi (sali 3 livelli: preprocessing -> src -> root)
     root_dir = Path(__file__).parent.parent.parent
     csv_path = root_dir / "dataset" / "how2sign_realigned_train.csv"
-    video_dir = root_dir / "dataset" / "How2Sign"
+    video_dir = Path("Z:/Documenti/Tesi/How2Sign_original/train_raw_videos/raw_videos")
     output_dir = root_dir / "dataset" / "segmented"
     
     # Verifica che il CSV esista
@@ -269,7 +269,7 @@ def main():
     mode = 'sample' if len(sys.argv) < 2 else sys.argv[1]
     
     if mode == 'test' or mode == 'sample':
-        logger.info("\n🔍 Avviando in MODALITÀ TEST (prime 2 video)")
+        logger.info("\n🔍 Avviando in MODALITÀ TEST (primi 2 video)")
         success, errors = segmenter.process_sample(num_videos=2)
     else:
         logger.info("\n▶️ Avviando processamento COMPLETO")

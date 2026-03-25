@@ -16,16 +16,18 @@ echo 1. Setup (installa dipendenze)
 echo 2. Diagnosi (verifica setup)
 echo 3. Test Segmentazione (2 video)
 echo 4. Segmentazione COMPLETA (tutti i video)
-echo 5. Esci
+echo 5. Estrazione Landmark (MediaPipe Holistic)
+echo 6. Esci
 echo.
 
-set /p choice="Inserisci il numero (1-5): "
+set /p choice="Inserisci il numero (1-6): "
 
 if "%choice%"=="1" goto setup
 if "%choice%"=="2" goto diagnose
 if "%choice%"=="3" goto test
 if "%choice%"=="4" goto full
-if "%choice%"=="5" goto end
+if "%choice%"=="5" goto landmarks
+if "%choice%"=="6" goto end
 
 echo Scelta non valida
 goto end
@@ -62,6 +64,15 @@ if /i "%confirm%"=="s" (
 ) else (
     echo Annullato
 )
+pause
+goto end
+
+:landmarks
+echo.
+echo Estrazione landmark dai video segmentati...
+echo (MediaPipe Holistic: Pose + Mani + Viso)
+echo.
+python src/preprocessing/landmark_extraction.py
 pause
 goto end
 

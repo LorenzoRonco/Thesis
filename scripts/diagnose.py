@@ -34,7 +34,8 @@ def diagnose_videos():
     """Diagnostica stati dei video nella cartella."""
     
     root_dir = Path(__file__).parent.parent  # Sali 2 livelli: scripts -> root
-    video_dir = root_dir / "dataset" / "How2Sign"
+    video_dir = Path("Z:/Documenti/Tesi/How2Sign_original/train_raw_videos/raw_videos"
+    )
     csv_path = root_dir / "dataset" / "how2sign_realigned_train.csv"
     
     print("\n" + "="*70)
@@ -118,9 +119,15 @@ def diagnose_videos():
         # Prova a ottenere info ffmpeg
         info = check_ffmpeg_info(video_file)
         if info:
-            duration = float(info['duration']) if info['duration'] != 'N/A' else None
-            if duration:
-                print(f"   Durata: {duration/60:.1f} minuti ({duration:.1f}s)")
+            try:
+                duration_str = info.get('duration', '').strip()
+                if duration_str and duration_str != 'N/A':
+                    duration = float(duration_str)
+                    print(f"   Durata: {duration/60:.1f} minuti ({duration:.1f}s)")
+                else:
+                    print("   ⚠️  Impossibile leggere durata")
+            except (ValueError, TypeError):
+                print("   ⚠️  Impossibile leggere durata")
         else:
             print("   ⚠️  Impossibile leggere info (ffprobe non disponibile)")
     
