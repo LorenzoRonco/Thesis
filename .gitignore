@@ -45,3 +45,5 @@ config_current.json
 
 # report
 video_integrity_report.txt
+
+.venv
