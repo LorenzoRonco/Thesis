@@ -47,3 +47,5 @@ config_current.json
 video_integrity_report.txt
 
 .venv
+
+visualization_output
