@@ -299,3 +299,96 @@ def prepare_for_network(landmarks_path, normalize=True, fill_missing=True,
     logger.info(f"Flattened to network input shape: {flat.shape}")
     
     return flat
+
+
+class LandmarkNormalizer:
+    """Normalize landmarks using root-relative and anatomical scaling."""
+    
+    @staticmethod
+    def normalize_by_root_relative_anatomical(landmarks):
+        """
+        Normalize landmarks using shoulder-centric root-relative positioning and anatomical scaling.
+        
+        Optimized for sign language recognition (focusing on face, hands, arms):
+        1. Root point: Shoulder center (midpoint of landmarks 11, 12) - PER FRAME
+        2. Scale: GLOBAL shoulder width (mean distance across all frames)
+        
+        Why global scale?
+        - Hands/arms move and expand the body outline, creating apparent size changes
+        - Using per-frame shoulder_width causes jittering in torso size
+        - Global scale is invariant to limb motion, preventing artificial size pulsing
+        - Neural network sees stable body proportions regardless of arm position
+        
+        Optimizations for sign language:
+        - Shoulders are always visible in frontal webcam video
+        - Root-relative centering per-frame keeps pose centered
+        - Global anatomical scale prevents animation artifacts
+        - Face and hands move relative to stable torso
+        
+        Args:
+            landmarks: array of shape (frames, 543, 4) with [x, y, z, confidence]
+                      MediaPipe format: 33 pose + 21 left_hand + 21 right_hand + 468 face
+        
+        Returns:
+            Normalized landmarks: shoulder-centered (per-frame), anatomically scaled (global)
+        """
+        if landmarks.ndim != 3:
+            raise ValueError(f"Expected 3D landmarks, got {landmarks.ndim}D")
+        
+        normalized = landmarks.copy().astype(np.float32)
+        
+        # STEP 0: Compute global shoulder width (mean across all frames)
+        shoulder_widths = []
+        for frame_idx in range(normalized.shape[0]):
+            frame = normalized[frame_idx]
+            
+            # Skip frames with missing shoulders
+            if frame[11, 3] == 0 or frame[12, 3] == 0:
+                continue
+            
+            left_shoulder = frame[11, :3]
+            right_shoulder = frame[12, :3]
+            shoulder_width = np.linalg.norm(right_shoulder - left_shoulder)
+            
+            if shoulder_width > 1e-6:  # Only valid shoulder widths
+                shoulder_widths.append(shoulder_width)
+        
+        if not shoulder_widths:
+            logger.error("No valid shoulder width found in video!")
+            return landmarks
+        
+        # Use median instead of mean (more robust to outliers)
+        global_shoulder_width = np.median(shoulder_widths)
+        logger.info(f"Global shoulder width: {global_shoulder_width:.6f} (median of {len(shoulder_widths)} frames)")
+        
+        # STEP 1-5: Apply normalization with GLOBAL scale
+        for frame_idx in range(normalized.shape[0]):
+            frame = normalized[frame_idx]
+            
+            # MediaPipe pose indices: 11 = left shoulder, 12 = right shoulder
+            left_shoulder = frame[11, :3]
+            right_shoulder = frame[12, :3]
+            
+            # Skip frames with missing shoulders
+            if frame[11, 3] == 0 or frame[12, 3] == 0:
+                logger.warning(f"Frame {frame_idx}: Shoulders not detected, skipping normalization")
+                continue
+            
+            # Step 1: Compute shoulder center (root point) - PER FRAME
+            shoulder_center = (left_shoulder + right_shoulder) / 2
+            
+            # Step 2: Root-relative centering: subtract shoulder center (x, y only)
+            normalized[frame_idx, :, 0] = frame[:, 0] - shoulder_center[0]
+            normalized[frame_idx, :, 1] = frame[:, 1] - shoulder_center[1]
+            # Keep z unchanged
+            
+            # Step 3: Anatomical scaling: divide by GLOBAL shoulder width (same for all frames)
+            normalized[frame_idx, :, 0] /= global_shoulder_width
+            normalized[frame_idx, :, 1] /= global_shoulder_width
+            normalized[frame_idx, :, 2] /= global_shoulder_width
+            
+            # Step 4: Shift to center at (0.5, 0.5) for neural network expectations
+            normalized[frame_idx, :, 0] += 0.5
+            normalized[frame_idx, :, 1] += 0.5
+        
+        return normalized
