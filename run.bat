@@ -14,32 +14,36 @@ echo === SETUP ===
 echo 1. Setup (installa dipendenze)
 echo 2. Diagnosi (verifica setup)
 echo.
+echo === VERIFICHE DATASET ===
+echo 3. Verifica Integrita' Video (CSV vs cartella)
+echo.
 echo === SEGMENTAZIONE VIDEO ===
-echo 3. Test Segmentazione (2 video)
-echo 4. Segmentazione COMPLETA (tutti i video)
+echo 4. Test Segmentazione (2 video)
+echo 5. Segmentazione COMPLETA (tutti i video)
 echo.
 echo === ESTRAZIONE LANDMARK ===
-echo 5. Estrazione Landmark (MediaPipe Holistic)
-echo 6. Visualizza Landmark Video
+echo 6. Estrazione Landmark (MediaPipe Holistic)
+echo 7. Visualizza Landmark Video
 echo.
 echo === PREPROCESSING (NORMALIZZAZIONE) ===
-echo 7. Normalizza Landmark (shoulder-centric + global scale)
-echo 8. Visualizza Effetto Normalizzazione (raw vs normalized)
+echo 8. Normalizza Landmark (shoulder-centric + global scale)
+echo 9. Visualizza Effetto Normalizzazione (raw vs normalized)
 echo.
-echo 9. Esci
+echo 10. Esci
 echo.
 
-set /p choice="Inserisci il numero (1-9): "
+set /p choice="Inserisci il numero (1-10): "
 
 if "%choice%"=="1" goto setup
 if "%choice%"=="2" goto diagnose
-if "%choice%"=="3" goto test
-if "%choice%"=="4" goto full
-if "%choice%"=="5" goto landmarks
-if "%choice%"=="6" goto visualize
-if "%choice%"=="7" goto normalize
-if "%choice%"=="8" goto visualize_norm
-if "%choice%"=="9" goto end
+if "%choice%"=="3" goto check_integrity
+if "%choice%"=="4" goto test
+if "%choice%"=="5" goto full
+if "%choice%"=="6" goto landmarks
+if "%choice%"=="7" goto visualize
+if "%choice%"=="8" goto normalize
+if "%choice%"=="9" goto visualize_norm
+if "%choice%"=="10" goto end
 
 echo Scelta non valida
 goto end
@@ -55,6 +59,15 @@ goto end
 echo.
 echo Avvio diagnostica...
 python scripts\diagnose.py
+pause
+goto end
+
+:check_integrity
+echo.
+echo Verifica Integrità Video...
+echo Confronto CSV vs cartella dataset
+echo.
+python scripts\check_video_integrity.py
 pause
 goto end
 
