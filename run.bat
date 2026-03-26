@@ -1,27 +1,35 @@
 @echo off
-REM Quick Start Batch per Video Segmentation
-REM Questo file facilita l'esecuzione degli script su Windows
+REM Pipeline Landmark - Sign Language Recognition
+REM Estrazione, Normalizzazione, Augmentation e Training di Landmark
 REM Collocato nella ROOT per facile accesso
 
 setlocal enabledelayedexpansion
 
 echo.
 echo ============================================================
-echo      VIDEO SEGMENTATION - MENU PRINCIPALE (Windows)
+echo      PIPELINE LANDMARK - SIGN LANGUAGE RECOGNITION
 echo ============================================================
 echo.
-echo Scegli un'opzione:
-echo.
+echo === SETUP ===
 echo 1. Setup (installa dipendenze)
 echo 2. Diagnosi (verifica setup)
+echo.
+echo === SEGMENTAZIONE VIDEO ===
 echo 3. Test Segmentazione (2 video)
 echo 4. Segmentazione COMPLETA (tutti i video)
+echo.
+echo === ESTRAZIONE LANDMARK ===
 echo 5. Estrazione Landmark (MediaPipe Holistic)
 echo 6. Visualizza Landmark Video
-echo 7. Esci
+echo.
+echo === PREPROCESSING (NORMALIZZAZIONE) ===
+echo 7. Normalizza Landmark (shoulder-centric + global scale)
+echo 8. Visualizza Effetto Normalizzazione (raw vs normalized)
+echo.
+echo 9. Esci
 echo.
 
-set /p choice="Inserisci il numero (1-7): "
+set /p choice="Inserisci il numero (1-9): "
 
 if "%choice%"=="1" goto setup
 if "%choice%"=="2" goto diagnose
@@ -29,7 +37,9 @@ if "%choice%"=="3" goto test
 if "%choice%"=="4" goto full
 if "%choice%"=="5" goto landmarks
 if "%choice%"=="6" goto visualize
-if "%choice%"=="7" goto end
+if "%choice%"=="7" goto normalize
+if "%choice%"=="8" goto visualize_norm
+if "%choice%"=="9" goto end
 
 echo Scelta non valida
 goto end
@@ -92,6 +102,26 @@ if defined RANDOM_VIDEO (
 ) else (
     echo Errore: nessun video trovato in dataset/segmented/
 )
+pause
+goto end
+:normalize
+echo.
+echo Normalizzazione Landmark...
+echo Metodo: Shoulder-centric + Global Scale
+echo Input:  dataset\landmarks\
+echo Output: dataset\landmarks_normalized\
+echo.
+python scripts\normalize_landmarks.py
+pause
+goto end
+
+:visualize_norm
+echo.
+echo Visualizzazione Effetto Normalizzazione...
+echo Confronto side-by-side: RAW vs NORMALIZED
+echo Output: visualization_output\normalization_check\
+echo.
+python scripts\visualize_normalization_effect.py
 pause
 goto end
 
