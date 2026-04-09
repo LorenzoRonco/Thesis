@@ -3,13 +3,19 @@
 Batch processing script for cropping all videos with their corresponding landmarks.
 
 Processa automaticamente TUTTI i video in dataset/segmented/ con i landmarks
-corrispondenti da dataset/landmarks_normalized/ e salva i risultati in
+corrispondenti da dataset/landmarks/ (RAW, non normalizzati) e salva i risultati in
 dataset/cropped/
 
+⚠️  IMPORTANTE: Usa landmarks RAW non i landmarks_normalized!
+Le landmarks normalizzate sono centrate sulle spalle per standardizzare input di reti neurali,
+quindi NON rappresentano le coordinate pixel reali. Il crop basato su quelle darebbe risultati
+errati, specialmente se l'utente è a lato dell'immagine.
+
 Usage:
-    python scripts/batch_crop_videos.py                          # Processa tutti
+    python scripts/batch_crop_videos.py                          # Processa tutti (fixed bbox)
     python scripts/batch_crop_videos.py --output-dir ./my_crops  # Percorso personalizzato
     python scripts/batch_crop_videos.py --padding 0.2            # Parametri personalizzati
+    python scripts/batch_crop_videos.py --smoothing global       # Usa bounding box media (no effetto zoom)
     python scripts/batch_crop_videos.py --skip-existing          # Salta video già processati
 """
 
@@ -59,7 +65,7 @@ def process_video(
             landmarks=landmarks,
             output_path=output_path,
             padding=padding,
-            target_size=(224, 224),
+            target_size=(200, 200),
             smoothing=smoothing,
             return_format="array"
         )
@@ -87,21 +93,26 @@ def main():
     )
     parser.add_argument(
         "--smoothing",
-        choices=["global", "moving"],
-        default="moving",
-        help="Temporal smoothing method (default: moving)"
+        choices=["fixed", "global", "moving"],
+        default="fixed",
+        help="Bounding box method: 'fixed' (no zoom, default) | 'global' (average) | 'moving' (moving avg)"
     )
     parser.add_argument(
         "--skip-existing",
         action="store_true",
         help="Skip videos that already have a cropped version"
     )
+    parser.add_argument(
+        "--use-normalized",
+        action="store_true",
+        help="Use normalized landmarks instead of raw landmarks (default: use raw)"
+    )
     
     args = parser.parse_args()
     
     # Definisci directory
     video_dir = Path("dataset/segmented")
-    landmarks_dir = Path("dataset/landmarks_normalized")
+    landmarks_dir = Path("dataset/landmarks_normalized" if args.use_normalized else "dataset/landmarks")
     output_dir = Path(args.output_dir)
     
     # Verifica che directory input esistano
@@ -128,10 +139,22 @@ def main():
     print("=" * 70)
     print(f"Input videos: {video_dir}")
     print(f"Landmarks: {landmarks_dir}")
+    if args.use_normalized:
+        print("  ⚠️  WARNING: Using NORMALIZED landmarks (centered on shoulders)")
+        print("  └── This may crop incorrect regions if person is off-center")
+    else:
+        print("  ✓ Using RAW landmarks (accurate pixel coordinates)")
     print(f"Output directory: {output_dir}")
+    print(f"Output size: 200x200 (MobileNet compatible)")
+    print(f"Bounding box: {args.smoothing.upper()}", end="")
+    if args.smoothing == "fixed":
+        print(" (maximum bbox, no zoom/dezoom) ✓")
+    elif args.smoothing == "global":
+        print(" (average bbox, minimal zoom)")
+    else:
+        print(" (moving average)")
     print(f"Total videos found: {len(video_files)}")
     print(f"Padding: {args.padding * 100:.0f}%")
-    print(f"Smoothing: {args.smoothing}")
     print("=" * 70 + "\n")
     
     # Statistiche

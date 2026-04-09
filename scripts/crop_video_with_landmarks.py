@@ -28,14 +28,13 @@ logger = logging.getLogger(__name__)
 
 class VideoLandmarkCropper:
     """
-    Ritaglia l'area di interesse nei video RGB utilizzando landmarks normalizzati.
+    Ritaglia l'area di interesse nei video RGB utilizzando landmarks.
     
     Caratteristiche:
-    - Denormalizzazione landmarks da [0,1] a coordinate pixel
-    - Calcolo bounding box dinamica per frame
+    - Denormalizzazione landmarks da pixel originali a coordinate frame
+    - Bounding box FISSA su tutto il video (no zoom/dezoom)
     - Padding e aspect ratio quadrato
-    - Smoothing temporale (global box o media mobile)
-    - Preprocessing per MobileNet (resize a 224x224 + normalizzazione ImageNet)
+    - Preprocessing per MobileNet (resize a 200x200 + normalizzazione ImageNet)
     """
     
     # Parametri ImageNet normalization per MobileNet
@@ -47,8 +46,8 @@ class VideoLandmarkCropper:
         video_path: str,
         landmarks: np.ndarray,
         padding_percent: float = 0.15,
-        target_size: Tuple[int, int] = (224, 224),
-        smoothing_method: str = "global",
+        target_size: Tuple[int, int] = (200, 200),
+        smoothing_method: str = "fixed",
         window_size: int = 5,
     ):
         """
@@ -56,11 +55,10 @@ class VideoLandmarkCropper:
         
         Args:
             video_path: Percorso al video RGB originale
-            landmarks: Array di landmarks normalizzati shape (frames, num_landmarks, 2)
-                      con valori in range [0, 1]
+            landmarks: Array di landmarks shape (frames, num_landmarks, 2) in coordinate pixel
             padding_percent: Percentuale di padding attorno alla bounding box (0.15 = 15%)
-            target_size: Dimensioni finali del ritaglio (default: 224x224 per MobileNet)
-            smoothing_method: "global" (media su tutto il video) o "moving" (media mobile)
+            target_size: Dimensioni finali del ritaglio (default: 200x200 per MobileNet)
+            smoothing_method: "fixed" (bounding box massima fissa, default) | "global" (media) | "moving" (media mobile)
             window_size: Finestra per media mobile (usato se smoothing_method="moving")
         
         Raises:
@@ -211,22 +209,33 @@ class VideoLandmarkCropper:
         y_max: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
-        Applica smoothing temporale per ridurre lo "saltellamento" dei crop.
+        Applica smoothing temporale o bounding box fissa.
         
         Args:
             x_min, x_max, y_min, y_max: Coordinate per ogni frame shape (frames,)
         
         Returns:
-            Tuple di coordinate smoothate
+            Tuple di coordinate smoothate/fisse
         """
-        if self.smoothing_method == "global":
+        if self.smoothing_method == "fixed":
+            # BOUNDING BOX MASSIMA FISSA su tutto il video (no zoom/dezoom)
+            x_min_smooth = np.full_like(x_min, np.min(x_min), dtype=np.float32)  # Min più piccolo
+            x_max_smooth = np.full_like(x_max, np.max(x_max), dtype=np.float32)  # Max più grande
+            y_min_smooth = np.full_like(y_min, np.min(y_min), dtype=np.float32)
+            y_max_smooth = np.full_like(y_max, np.max(y_max), dtype=np.float32)
+            
+            logger.info(
+                "Bounding box: FIXED (massima su tutti i frame, no zoom/dezoom) ✓"
+            )
+        
+        elif self.smoothing_method == "global":
             # Usa una bounding box globale (media su tutto il video)
             x_min_smooth = np.full_like(x_min, np.mean(x_min), dtype=np.float32)
             x_max_smooth = np.full_like(x_max, np.mean(x_max), dtype=np.float32)
             y_min_smooth = np.full_like(y_min, np.mean(y_min), dtype=np.float32)
             y_max_smooth = np.full_like(y_max, np.mean(y_max), dtype=np.float32)
             
-            logger.info("Smoothing temporale: Metodo GLOBAL (bounding box media)")
+            logger.info("Bounding box: GLOBAL (media su tutti i frame)")
         
         elif self.smoothing_method == "moving":
             # Media mobile con finestra specificata
@@ -238,13 +247,13 @@ class VideoLandmarkCropper:
             y_max_smooth = uniform_filter1d(y_max, size=self.window_size, mode='nearest')
             
             logger.info(
-                f"Smoothing temporale: Metodo MOVING AVERAGE (window_size={self.window_size})"
+                f"Bounding box: MOVING AVERAGE (window_size={self.window_size})"
             )
         
         else:
             raise ValueError(
                 f"Metodo smoothing sconosciuto: {self.smoothing_method}. "
-                f"Scegli tra 'global' o 'moving'"
+                f"Scegli tra 'fixed' (default), 'global' o 'moving'"
             )
         
         return x_min_smooth, x_max_smooth, y_min_smooth, y_max_smooth
@@ -296,8 +305,8 @@ class VideoLandmarkCropper:
         
         Returns:
             Tensor/Array di shape:
-            - Se return_tensors=True e torch disponibile: (frames, 3, 224, 224) come torch.Tensor (normalizzato)
-            - Altrimenti: (frames, 224, 224, 3) come np.ndarray [0, 255]
+            - Se return_tensors=True e torch disponibile: (frames, 3, 200, 200) come torch.Tensor (normalizzato)
+            - Altrimenti: (frames, 200, 200, 3) come np.ndarray [0, 255]
         
         Example:
             >>> cropper = VideoLandmarkCropper("video.mp4", landmarks)
@@ -445,8 +454,8 @@ def crop_video_with_landmarks(
     landmarks: np.ndarray,
     output_path: Optional[str] = None,
     padding: float = 0.15,
-    target_size: Tuple[int, int] = (224, 224),
-    smoothing: str = "global",
+    target_size: Tuple[int, int] = (200, 200),
+    smoothing: str = "fixed",
     return_format: str = "tensor",
 ) -> Union[np.ndarray, Any]:  # Any per torch.Tensor se disponibile
     """
@@ -454,11 +463,11 @@ def crop_video_with_landmarks(
     
     Args:
         video_path: Percorso al video RGB
-        landmarks: Array normalizzati shape (frames, num_landmarks, 2)
+        landmarks: Array shape (frames, num_landmarks, 2) in coordinate pixel
         output_path: Percorso per salvare il video ritagliato (opzionale)
         padding: Percentuale padding (default: 0.15 = 15%)
-        target_size: Dimensioni finali (default: (224, 224) per MobileNet)
-        smoothing: "global" o "moving"
+        target_size: Dimensioni finali (default: (200, 200) per MobileNet)
+        smoothing: "fixed" (bounding box massima fissa, default) | "global" (media) | "moving" (media mobile)
         return_format: "tensor" (torch, normalizzato) o "array" (numpy, [0,255])
     
     Returns:
