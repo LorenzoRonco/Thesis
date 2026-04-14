@@ -28,7 +28,11 @@ from tqdm import tqdm
 import time
 from datetime import timedelta
 
-from crop_video_with_landmarks import crop_video_with_landmarks
+# Add src to path
+root_dir = Path(__file__).parent.parent
+sys.path.insert(0, str(root_dir / "src"))
+
+from preprocessing.crop_video_with_landmarks import crop_video_with_landmarks
 
 
 def find_landmark_file(video_path: str, landmarks_dir: Path) -> Path:

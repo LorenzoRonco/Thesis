@@ -4,7 +4,7 @@ Normalize landmarks using per-frame bounding box normalization.
 Preprocessing step: landmarks grezzi → landmarks normalizzati.
 
 Usage:
-    python scripts/normalize_landmarks.py
+    python -m preprocessing.normalize_landmarks
     
 Output:
     dataset/landmarks_normalized/ (30k file normalized)
@@ -16,7 +16,7 @@ import numpy as np
 import logging
 
 # Add src to path
-root_dir = Path(__file__).parent.parent
+root_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(root_dir / "src"))
 
 from preprocessing.landmark_utils import LandmarkLoader, LandmarkNormalizer
@@ -108,7 +108,7 @@ def normalize_landmarks_batch(landmarks_dir, output_dir):
 
 def main():
     """Main entry point."""
-    root_dir = Path(__file__).parent.parent
+    root_dir = Path(__file__).parent.parent.parent
     landmarks_dir = root_dir / "dataset" / "landmarks"
     output_dir = root_dir / "dataset" / "landmarks_normalized"
     

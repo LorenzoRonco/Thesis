@@ -40,7 +40,7 @@ scripts/
 ### Metodo 1: Interfaccia Semplificata (Uno-liner)
 
 ```python
-from crop_video_with_landmarks import crop_video_with_landmarks
+from preprocessing.crop_video_with_landmarks import crop_video_with_landmarks
 import numpy as np
 
 # Carica landmarks normalizzati

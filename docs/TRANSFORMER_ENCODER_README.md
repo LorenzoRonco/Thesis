@@ -305,7 +305,7 @@ for layer_idx, w in enumerate(attn_weights):
 
 ```python
 import numpy as np
-from scripts.normalize_landmarks import LandmarkNormalizer
+from preprocessing.normalize_landmarks import LandmarkNormalizer
 
 # Carica landmarks grezzi
 landmarks_raw = load_landmarks('path/to/video')  # (frames, pose+hand+face)
