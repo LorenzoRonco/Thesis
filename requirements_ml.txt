@@ -1,0 +1,22 @@
+# Deep Learning Dependencies for Dual-Stream Model
+
+# Core Deep Learning
+torch>=2.0.0                     # PyTorch
+torchvision>=0.15.0             # Computer vision utilities
+torchaudio>=2.0.0               # Audio processing
+
+# The existing requirements
+pandas>=1.3.0
+numpy>=1.20.0
+matplotlib>=3.3.0
+seaborn>=0.11.0
+opencv-python>=4.5.0
+ffmpeg-python==0.2.0
+mediapipe>=0.10.33
+scikit-learn>=0.24.0
+scipy>=1.7.0
+
+# Additional utilities
+tensorboard>=2.12.0             # For training visualization
+tqdm>=4.65.0                    # Progress bars
+pyyaml>=6.0                     # Configuration files
