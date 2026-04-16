@@ -251,7 +251,7 @@ def main():
     # Configurazione percorsi (sali 3 livelli: preprocessing -> src -> root)
     root_dir = Path(__file__).parent.parent.parent
     csv_path = root_dir / "dataset" / "how2sign_realigned_train.csv"
-    video_dir = Path("Z:/Documenti/Tesi/How2Sign_original/train_raw_videos/raw_videos")
+    video_dir = root_dir / "dataset" / "raw_videos"
     output_dir = root_dir / "dataset" / "segmented"
     
     # Verifica che il CSV esista

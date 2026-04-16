@@ -34,8 +34,7 @@ def diagnose_videos():
     """Diagnostica stati dei video nella cartella."""
     
     root_dir = Path(__file__).parent.parent  # Sali 2 livelli: scripts -> root
-    video_dir = Path("Z:/Documenti/Tesi/How2Sign_original/train_raw_videos/raw_videos"
-    )
+    video_dir = root_dir / "dataset" / "raw_videos"
     csv_path = root_dir / "dataset" / "how2sign_realigned_train.csv"
     
     print("\n" + "="*70)

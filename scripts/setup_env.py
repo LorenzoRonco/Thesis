@@ -11,6 +11,45 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def create_venv():
+    """Crea un virtual environment nella directory root."""
+    root_dir = Path(__file__).parent.parent  # Sali 2 livelli: scripts -> root
+    venv_dir = root_dir / ".venv"
+    
+    if venv_dir.exists():
+        print(f"✓ Virtual environment già presente: .venv\n")
+        return True
+    
+    print("Creazione virtual environment (.venv)...\n")
+    try:
+        result = subprocess.run(
+            [sys.executable, '-m', 'venv', str(venv_dir)],
+            capture_output=False
+        )
+        
+        if result.returncode == 0:
+            print("\n✓ Virtual environment creato con successo!")
+            return True
+        else:
+            print(f"\n❌ Errore durante la creazione del venv (exit code: {result.returncode})")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Errore: {e}")
+        return False
+
+
+def get_venv_python():
+    """Ritorna il path del python nel virtual environment."""
+    root_dir = Path(__file__).parent.parent
+    venv_dir = root_dir / ".venv"
+    
+    if sys.platform == 'win32':
+        return venv_dir / 'Scripts' / 'python.exe'
+    else:
+        return venv_dir / 'bin' / 'python'
+
+
 def check_dependencies():
     """Verifica e installa tutte le dipendenze da requirements.txt."""
     print("Installazione dipendenze da requirements.txt...\n")
@@ -22,11 +61,26 @@ def check_dependencies():
         print(f"❌ File requirements.txt non trovato: {requirements_file}")
         return False
     
+    # Usa il python dal venv se esiste, altrimenti usa il system python
+    venv_python = get_venv_python()
+    if venv_python.exists():
+        python_exe = str(venv_python)
+    else:
+        python_exe = sys.executable
+    
     try:
         # Installa da requirements.txt
         print(f"Leggo da: {requirements_file}")
         result = subprocess.run(
-            [sys.executable, '-m', 'pip', 'install', '-r', str(requirements_file)],
+            [python_exe, '-m', 'pip', 'install', '--upgrade', 'pip'],
+            capture_output=False
+        )
+        
+        if result.returncode != 0:
+            print(f"\n⚠️  Avviso: pip upgrade non riuscito")
+        
+        result = subprocess.run(
+            [python_exe, '-m', 'pip', 'install', '-r', str(requirements_file)],
             capture_output=False
         )
         
@@ -102,6 +156,7 @@ def main():
     print("SETUP VIDEO SEGMENTATION")
     print("="*60 + "\n")
     
+    create_venv()
     check_dependencies()
     structure_ok = check_structure()
     create_segmented_folder()

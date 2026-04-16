@@ -170,7 +170,7 @@ def main():
     # Configurazione percorsi
     root_dir = Path(__file__).parent.parent
     csv_path = root_dir / "dataset" / "how2sign_realigned_train.csv"
-    video_dir = "Z:\\Documenti\\Tesi\\How2Sign_original\\train_raw_videos\\raw_videos"
+    video_dir = str(root_dir / "dataset" / "raw_videos")
     
     # Esegui verifica
     result = check_video_integrity(str(csv_path), video_dir)
