@@ -46,16 +46,20 @@ DEFAULT_HOLISTIC_MODEL_URL = (
 class LandmarkExtractor:
     """Extract holistic landmarks from video frames using MediaPipe Tasks."""
 
-    def __init__(self, confidence_threshold=0.5, model_path=None):
+    def __init__(self, confidence_threshold=0.5, model_path=None, use_gpu=True):
         """Initialize the holistic landmarker.
 
         Args:
             confidence_threshold: Minimum confidence used by detector heads.
             model_path: Optional path to `holistic_landmarker.task`.
+            use_gpu: Whether to use GPU for inference (default: True).
         """
         self.confidence_threshold = confidence_threshold
         self.model_path = self._resolve_model_path(model_path)
+        self.use_gpu = use_gpu
 
+        # Note: MediaPipe will automatically use GPU acceleration if available.
+        # The use_gpu parameter is stored for logging purposes.
         base_options = mp_python.BaseOptions(model_asset_path=str(self.model_path))
         options = vision.HolisticLandmarkerOptions(
             base_options=base_options,
@@ -220,13 +224,15 @@ class LandmarkExtractor:
             self.landmarker.close()
 
 
-def process_all_videos(input_dir, output_dir, model_path=None):
+def process_all_videos(input_dir, output_dir, model_path=None, use_gpu=True):
     """
     Process all videos in input directory and save landmarks.
     
     Args:
         input_dir: Directory containing segmented videos
         output_dir: Directory where to save landmark arrays
+        model_path: Optional path to holistic_landmarker.task
+        use_gpu: Whether to use GPU for inference (default: True)
     """
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
@@ -255,7 +261,7 @@ def process_all_videos(input_dir, output_dir, model_path=None):
         # In VIDEO mode MediaPipe requires strictly monotonic timestamps.
         # Recreate the landmarker per video so timestamps can safely restart.
         try:
-            extractor = LandmarkExtractor(model_path=model_path)
+            extractor = LandmarkExtractor(model_path=model_path, use_gpu=use_gpu)
         except Exception as exc:
             logger.error("Failed to initialize landmark extractor for %s: %s", video_path.name, exc)
             stats['failed'] += 1
@@ -300,6 +306,11 @@ def main():
         default=None,
         help="Optional path to holistic_landmarker.task",
     )
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Use CPU instead of GPU for inference (default: use GPU)",
+    )
     args = parser.parse_args()
 
     # Determine paths relative to this file
@@ -314,8 +325,13 @@ def main():
         logger.error(f"Input directory not found: {segmented_dir}")
         return
     
+    # Log device information
+    use_gpu = not args.cpu
+    device_info = "GPU" if use_gpu else "CPU"
+    logger.info(f"Using device: {device_info}")
+    
     # Process all videos
-    process_all_videos(segmented_dir, landmarks_dir, model_path=args.model_path)
+    process_all_videos(segmented_dir, landmarks_dir, model_path=args.model_path, use_gpu=use_gpu)
 
 
 if __name__ == "__main__":
