@@ -1,5 +1,6 @@
 # Dataset e Video
 dataset/
+checkpoints/
 *.mp4
 *.mov
 *.avi
