@@ -22,271 +22,194 @@ import cv2
 
 class How2SignDataset(Dataset):
     """
-    Dataset per How2Sign video con landmarks.
-    
-    Structure assunto:
-      dataset/
-        how2sign_realigned_train.csv  (metadata)
-        landmarks_normalized/
-          <video_id>_landmarks.npy
-        segmented/
-          <video_id>_frame_<n>.jpg
+    Dataset per How2Sign.
+
+    Ogni sample restituisce:
+        landmarks   : Tensor [T, 2108]         — landmark appiattiti per frame
+        video_frames: Tensor [T, 3, 224, 224]  — frame RGB normalizzati
+        sentence    : str                       — testo originale (tokenizzato fuori)
+        length      : int                       — numero frame reali (senza padding)
     """
     
     def __init__(
         self,
         csv_path: Path,
         landmarks_dir: Path,
-        segmented_dir: Path,
+        cropped_dir: Path,
         max_frames: int = 150,
         img_size: Tuple[int, int] = (224, 224),
         num_samples: Optional[int] = None,
-        device: torch.device = torch.device('cpu'),
     ):
         """
         Inizializza dataset.
-        
-        Args:
-            csv_path: Path al CSV with metadata
-            landmarks_dir: Path a directory landmarks_normalized
-            segmented_dir: Path a directory con video segmented
-            max_frames: Numero massimo frame per padding
-            img_size: Dimensione risize frame
-            num_samples: Limit numero campioni (per testing)
-            device: Device per tensori
         """
         self.csv_path = Path(csv_path)
         self.landmarks_dir = Path(landmarks_dir)
-        self.segmented_dir = Path(segmented_dir)
+        self.cropped_dir = Path(cropped_dir)
         self.max_frames = max_frames
         self.img_size = img_size
-        self.device = device
         
-        # Carica metadata
-        self.metadata = pd.read_csv(self.csv_path)
-        if num_samples:
-            self.metadata = self.metadata.iloc[:num_samples]
-        
-        print(f"[Dataset] Loaded {len(self.metadata)} samples from CSV")
-    
-    def load_landmarks(self, video_id: str, max_frames: int) -> torch.Tensor:
-        """
-        Carica landmarks normalizzati.
-        
-        Args:
-            video_id: ID video
-            max_frames: Numero frame max
-        
-        Returns:
-            Tensor (max_frames, 2108) con padding se necessario
-        """
-        landmarks_file = self.landmarks_dir / f"{video_id}_landmarks.npy"
-        
-        try:
-            landmarks = np.load(landmarks_file)  # (T, 2108)
-            
-            # Padding se necessario
-            if landmarks.shape[0] < max_frames:
-                padding = np.zeros(
-                    (max_frames - landmarks.shape[0], landmarks.shape[1]),
-                    dtype=landmarks.dtype
-                )
-                landmarks = np.vstack([landmarks, padding])
-            else:
-                landmarks = landmarks[:max_frames]
-            
-            return torch.from_numpy(landmarks).float().to(self.device)
-        
-        except FileNotFoundError:
-            print(f"⚠️  Landmarks not found: {video_id}")
-            return torch.zeros(max_frames, 2108).to(self.device)
-    
-    def load_video_frames(self, video_id: str, max_frames: int) -> torch.Tensor:
-        """
-        Carica frame video segmented.
-        
-        Args:
-            video_id: ID video
-            max_frames: Numero frame max
-        
-        Returns:
-            Tensor (max_frames, 3, 224, 224)
-        """
-        frames = []
-        
-        # Cerca file frame
-        frame_pattern = f"{video_id}_frame_*.jpg"
-        frame_files = sorted(self.segmented_dir.glob(frame_pattern))
-        
-        if not frame_files:
-            print(f"⚠️  Frames not found: {video_id}")
-            return torch.zeros(max_frames, 3, *self.img_size).to(self.device)
-        
-        for frame_path in frame_files[:max_frames]:
-            try:
-                # Carica immagine
-                img = cv2.imread(str(frame_path))
-                if img is None:
-                    continue
-                
-                # Converti BGR → RGB
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                
-                # Resize
-                img = cv2.resize(img, self.img_size)
-                
-                # Normalizzazione [0, 1]
-                img = img.astype(np.float32) / 255.0
-                
-                # Transponi a (3, H, W)
-                img = np.transpose(img, (2, 0, 1))
-                
-                frames.append(torch.from_numpy(img).float())
-            
-            except Exception as e:
-                print(f"⚠️  Error loading frame {frame_path}: {e}")
-                continue
-        
-        # Stack frames
-        if frames:
-            video = torch.stack(frames)  # (num_loaded, 3, H, W)
-        else:
-            video = torch.zeros(1, 3, *self.img_size).float()
-        
-        # Padding frame
-        if video.shape[0] < max_frames:
-            padding_frames = torch.zeros(
-                max_frames - video.shape[0],
-                3,
-                *self.img_size
-            )
-            video = torch.cat([video, padding_frames], dim=0)
-        else:
-            video = video[:max_frames]
-        
-        return video.to(self.device)
-    
-    def load_translation(self, row: pd.Series) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Carica traduzione (sarà implementato basato su dataset reale).
-        
-        Per ora, ritorna tensor casuali.
-        In produzione, integra tokenizer real text.
-        
-        Returns:
-            (target_tokens, target_labels)
-        """
-        # TODO: Implementa caricamento real testo
-        # Placeholder per testing
-        text_max_len = 512
-        vocab_size = 10000
-        
-        target_tokens = torch.zeros(text_max_len, dtype=torch.long)
-        target_tokens[0] = 1  # BOS
-        target_tokens[1:10] = torch.randint(2, vocab_size, (9,))
-        target_tokens[10] = 2  # EOS
-        
-        target_labels = torch.zeros_like(target_tokens)
-        target_labels[:-1] = target_tokens[1:]
-        target_labels[-1] = 2  # EOS
-        
-        return target_tokens, target_labels
-    
+        df = pd.read_csv(csv_path, sep='\t')
+
+        # Filtra solo i sample con file .npy esistente
+        df['npy_path'] = df['SENTENCE_NAME'].apply(
+            lambda name: self.landmarks_dir / f"{name}_landmarks.npy"
+        )
+        exists_mask = df['npy_path'].apply(lambda p: p.exists())
+        n_missing = (~exists_mask).sum()
+        if n_missing > 0:
+            print(f"[Dataset] {n_missing} file .npy mancanti, ignorati.")
+
+        self.df = df[exists_mask].reset_index(drop=True)
+
+        if num_samples is not None:
+            # iloc estrae intervalli di un dataframe
+            self.df = self.df.iloc[:num_samples].reset_index(drop=True) 
+
+        print(f"[Dataset] {len(self.df)} sample pronti.")
+
     def __len__(self) -> int:
-        return len(self.metadata)
-    
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        landmarks, length = self._load_landmarks(row['npy_path'])
+        video_frames = self._load_video_frames(
+            sentence_id=row['SENTENCE_ID'],
+            sentence_name=row['SENTENCE_NAME'],
+            length=length
+        )
+        sentence = row['SENTENCE']
+
+        return landmarks, video_frames, sentence, length
+
+    # ------------------------------------------------------------------
+
+    def _load_landmarks(self, npy_path: Path) -> Tuple[torch.Tensor, int]:
         """
-        Ritorna: (landmarks, video_frames, target_tokens, target_labels)
+        Carica e appiattisce i landmarks.
+
+        Returns:
+            landmarks : [T, 2108]
+            length    : numero frame reali (prima del taglio)
         """
-        row = self.metadata.iloc[idx]
-        video_id = row['video_id']  # Adjust column name based on CSV
-        
-        landmarks = self.load_landmarks(video_id, self.max_frames)
-        video_frames = self.load_video_frames(video_id, self.max_frames)
-        target_tokens, target_labels = self.load_translation(row)
-        
-        return landmarks, video_frames, target_tokens, target_labels
+        data = np.load(npy_path).astype(np.float32)  # [T, 527, 4]
+        data = data.reshape(data.shape[0], -1)        # [T, 2108]
+
+        length = data.shape[0]
+
+        if self.max_frames is not None and length > self.max_frames:
+            data = data[:self.max_frames]
+            length = self.max_frames
+
+        return torch.from_numpy(data), length
 
 
-def create_real_dataloader(
+    def _load_video_frames(self, sentence_id: str, sentence_name: str, length: int) -> torch.Tensor:
+        """
+        Carica frame da video .mp4 croppato.
+
+        Args:
+            sentence_id  : es. --7E2sU6zP4_10
+            sentence_name: es. --7E2sU6zP4_10-5-rgb_front
+            length       : numero frame da caricare (allineato ai landmark)
+
+        Returns:
+            Tensor [length, 3, H, W]
+        """
+        
+        video_path = self.cropped_dir / f"{sentence_id}_{sentence_name}_cropped.mp4"
+
+        if not video_path.exists():
+            print(f"⚠️  Video non trovato: {video_path.name}")
+            return torch.zeros(length, 3, *self.img_size)
+
+        cap = cv2.VideoCapture(str(video_path))
+        frames = []
+
+        while len(frames) < length:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = cv2.resize(frame, self.img_size)
+            frame = frame.astype(np.float32) / 255.0
+            frame = np.transpose(frame, (2, 0, 1))
+            frames.append(torch.from_numpy(frame))
+
+        cap.release()
+
+        # Se il video ha meno frame dei landmark, padda con zeri
+        if len(frames) < length:
+            padding = torch.zeros(length - len(frames), 3, *self.img_size)
+            if frames:
+                return torch.cat([torch.stack(frames), padding], dim=0)
+            else:
+                return padding
+       
+# ----------------------------------------------------------------------
+# collate_fn — padding dinamico per batch
+# ----------------------------------------------------------------------
+
+def collate_fn(
+    batch: List[Tuple[torch.Tensor, torch.Tensor, str, int]]
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[str], List[int]]:
+    """
+    Padda landmarks e frame alla lunghezza massima del batch.
+
+    Returns:
+        landmarks_padded  : [B, T_max, 2108]
+        frames_padded     : [B, T_max, 3, H, W]
+        padding_mask      : [B, T_max]  — True sui frame di padding
+        sentences         : List[str]
+        lengths           : List[int]
+    """
+    landmarks_list, frames_list, sentences, lengths = zip(*batch)
+
+    T_max = max(lengths)
+    B = len(lengths)
+    _, H, W = frames_list[0].shape[1], frames_list[0].shape[2], frames_list[0].shape[3]
+    landmark_dim = landmarks_list[0].shape[1]
+
+    landmarks_padded = torch.zeros(B, T_max, landmark_dim)
+    frames_padded    = torch.zeros(B, T_max, 3, H, W)
+    padding_mask     = torch.ones(B, T_max, dtype=torch.bool)  # True = padding
+
+    for i, (lm, fr, length) in enumerate(zip(landmarks_list, frames_list, lengths)):
+        landmarks_padded[i, :length] = lm
+        frames_padded[i, :length]    = fr
+        padding_mask[i, :length]     = False  # False = frame valido
+
+    return landmarks_padded, frames_padded, padding_mask, list(sentences), list(lengths)
+
+
+# ----------------------------------------------------------------------
+# Factory
+# ----------------------------------------------------------------------
+
+def create_dataloader(
     csv_path: Path,
     landmarks_dir: Path,
-    segmented_dir: Path,
-    batch_size: int = 32,
-    num_samples: Optional[int] = None,
+    cropped_dir: Path,
+    batch_size: int = 16,
     shuffle: bool = True,
-    device: torch.device = torch.device('cpu'),
+    num_workers: int = 4,
+    num_samples: Optional[int] = None,
+    max_frames: Optional[int] = None,
 ) -> DataLoader:
-    """
-    Crea DataLoader con dati reali How2Sign.
-    
-    Args:
-        csv_path: Path to metadata CSV
-        landmarks_dir: Path to landmarks directory
-        segmented_dir: Path to segmented frames directory
-        batch_size: Batch size
-        num_samples: Limit numero samples (for testing)
-        shuffle: Shuffle dataset
-        device: Device for tensors
-    
-    Returns:
-        DataLoader
-    """
     dataset = How2SignDataset(
         csv_path=csv_path,
         landmarks_dir=landmarks_dir,
-        segmented_dir=segmented_dir,
+        cropped_dir=cropped_dir,
+        max_frames=max_frames,
         num_samples=num_samples,
-        device=device,
     )
-    
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=4,
-        pin_memory=True if device.type == 'cuda' else False,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True,
     )
-
-
-# =============================================================================
-# Usage Example
-# =============================================================================
-
-if __name__ == "__main__":
-    """
-    Esempio di utilizzo del dataset reale.
-    """
-    
-    from pathlib import Path
-    
-    # Percorsi (adjust based on your structure)
-    dataset_dir = Path("dataset")
-    csv_path = dataset_dir / "how2sign_realigned_train.csv"
-    landmarks_dir = dataset_dir / "landmarks_normalized"
-    segmented_dir = dataset_dir / "segmented"
-    
-    # Crea dataset
-    print("Creating real How2Sign dataset...")
-    dataset = How2SignDataset(
-        csv_path=csv_path,
-        landmarks_dir=landmarks_dir,
-        segmented_dir=segmented_dir,
-        num_samples=1000,  # Test con 1000 campioni
-        device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-    )
-    
-    # Crea DataLoader
-    loader = DataLoader(dataset, batch_size=32, shuffle=True)
-    
-    # Test caricamento batch
-    print(f"Dataset size: {len(dataset)}")
-    print("Loading sample batch...")
-    
-    for landmarks, video_frames, target_tokens, target_labels in loader:
-        print(f"✓ Landmarks shape: {landmarks.shape}")
-        print(f"✓ Video frames shape: {video_frames.shape}")
-        print(f"✓ Target tokens shape: {target_tokens.shape}")
-        print(f"✓ Target labels shape: {target_labels.shape}")
-        break
