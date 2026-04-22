@@ -122,9 +122,6 @@ class LandmarkExtractor:
             # List to store landmarks for all frames.
             all_landmarks = []
             frame_count = 0
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            if not fps or fps <= 0:
-                fps = 30.0
             
             while True:
                 ret, frame = cap.read()
@@ -135,7 +132,9 @@ class LandmarkExtractor:
                 # Convert BGR to RGB and run task in VIDEO mode.
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-                timestamp_ms = int((frame_count / fps) * 1000)
+                # Use frame_count * 33 for monotonically increasing timestamps (assumes ~30 fps)
+                # This guarantees strict monotonic increase without floating point issues
+                timestamp_ms = frame_count * 33
                 results = self.landmarker.detect_for_video(mp_image, timestamp_ms)
 
                 # Extract landmarks

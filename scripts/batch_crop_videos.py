@@ -17,6 +17,11 @@ Usage:
     python scripts/batch_crop_videos.py --padding 0.2            # Parametri personalizzati
     python scripts/batch_crop_videos.py --smoothing global       # Usa bounding box media (no effetto zoom)
     python scripts/batch_crop_videos.py --skip-existing          # Salta video già processati
+    python scripts/batch_crop_videos.py \
+        --video-dir dataset/segmented_validation \
+        --landmarks-dir dataset/landmarks_validation \
+        --output-dir dataset/cropped_validation                 # Validation set
+    python scripts/batch_crop_videos.py --validation             # Validation set (shortcut)
 """
 
 import sys
@@ -85,9 +90,30 @@ def main():
         description="Batch crop all videos with their landmarks"
     )
     parser.add_argument(
+        "--video-dir",
+        default="dataset/segmented",
+        help="Input directory with segmented videos (default: dataset/segmented)"
+    )
+    parser.add_argument(
+        "--landmarks-dir",
+        default=None,
+        help=(
+            "Directory with landmarks .npy files. Default is based on --use-normalized: "
+            "dataset/landmarks or dataset/landmarks_normalized"
+        )
+    )
+    parser.add_argument(
         "--output-dir",
         default="dataset/cropped",
         help="Output directory for cropped videos (default: dataset/cropped)"
+    )
+    parser.add_argument(
+        "--validation",
+        action="store_true",
+        help=(
+            "Shortcut for validation set: uses dataset/segmented_validation, "
+            "dataset/landmarks_validation and dataset/cropped_validation unless overridden"
+        )
     )
     parser.add_argument(
         "--padding",
@@ -111,12 +137,31 @@ def main():
         action="store_true",
         help="Use normalized landmarks instead of raw landmarks (default: use raw)"
     )
+    parser.add_argument(
+        "--max-videos",
+        type=int,
+        default=None,
+        help="Maximum number of videos to process (e.g., 3000). Processes first N videos in order. (default: all)"
+    )
     
     args = parser.parse_args()
     
     # Definisci directory
-    video_dir = Path("dataset/segmented")
-    landmarks_dir = Path("dataset/landmarks_normalized" if args.use_normalized else "dataset/landmarks")
+    if args.validation:
+        if args.video_dir == "dataset/segmented":
+            args.video_dir = "dataset/segmented_validation"
+        if args.landmarks_dir is None:
+            args.landmarks_dir = "dataset/landmarks_validation"
+        if args.output_dir == "dataset/cropped":
+            args.output_dir = "dataset/cropped_validation"
+
+    video_dir = Path(args.video_dir)
+    if args.landmarks_dir:
+        landmarks_dir = Path(args.landmarks_dir)
+    else:
+        landmarks_dir = Path(
+            "dataset/landmarks_normalized" if args.use_normalized else "dataset/landmarks"
+        )
     output_dir = Path(args.output_dir)
     
     # Verifica che directory input esistano
@@ -133,6 +178,10 @@ def main():
     
     # Cerca tutti i video
     video_files = sorted([f for f in video_dir.glob("*-rgb_front.mp4")])
+    
+    # Limita al numero massimo di video se specificato
+    if args.max_videos is not None:
+        video_files = video_files[:args.max_videos]
     
     if not video_files:
         print(f"✗ No videos found in {video_dir}")
@@ -157,7 +206,10 @@ def main():
         print(" (average bbox, minimal zoom)")
     else:
         print(" (moving average)")
-    print(f"Total videos found: {len(video_files)}")
+    if args.max_videos is not None:
+        print(f"Total videos found: {len(video_files)} (limited to first {args.max_videos})")
+    else:
+        print(f"Total videos found: {len(video_files)}")
     print(f"Padding: {args.padding * 100:.0f}%")
     print("=" * 70 + "\n")
     
