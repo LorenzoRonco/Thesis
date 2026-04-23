@@ -51,6 +51,7 @@ from torch.utils.data import DataLoader
 from pathlib import Path
 import time
 import json
+from contextlib import nullcontext
 from transformers import BartTokenizer
 
 from src.models import SignLanguageTranslator
@@ -130,6 +131,8 @@ def train_epoch(
     device: torch.device,
     epoch: int,
     num_epochs: int,
+    use_amp: bool,
+    scaler: torch.amp.GradScaler | None,
 ) -> dict:
     model.train()
     total_loss = 0.0
@@ -137,9 +140,9 @@ def train_epoch(
     start = time.time()
 
     for step, (landmarks, video_frames, padding_mask, sentences, lengths) in enumerate(loader):
-        landmarks    = landmarks.to(device)
-        video_frames = video_frames.to(device)
-        padding_mask = padding_mask.to(device)
+        landmarks    = landmarks.to(device, non_blocking=True)
+        video_frames = video_frames.to(device, non_blocking=True)
+        padding_mask = padding_mask.to(device, non_blocking=True)
 
         # Tokenizza le frasi target
         encoded = tokenizer(
@@ -156,23 +159,42 @@ def train_epoch(
         decoder_input  = target_tokens[:, :-1]  # [B, L-1]
         decoder_target = target_tokens[:, 1:]   # [B, L-1]
 
-        logits = model(
-            landmarks=landmarks,
-            video_frames=video_frames,
-            padding_mask=padding_mask,
-            target_tokens=decoder_input,
-        )  # [B, L-1, vocab_size]
+        optimizer.zero_grad(set_to_none=True)
+        amp_ctx = torch.autocast(device_type='cuda', dtype=torch.float16) if use_amp else nullcontext()
 
-        loss = criterion(
-            logits.reshape(-1, logits.size(-1)),
-            decoder_target.reshape(-1),
-        )
+        try:
+            with amp_ctx:
+                logits = model(
+                    landmarks=landmarks,
+                    video_frames=video_frames,
+                    padding_mask=padding_mask,
+                    target_tokens=decoder_input,
+                )  # [B, L-1, vocab_size]
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        scheduler.step()
+                loss = criterion(
+                    logits.reshape(-1, logits.size(-1)),
+                    decoder_target.reshape(-1),
+                )
+
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+
+            scheduler.step()
+        except torch.OutOfMemoryError:
+            # Evita il crash completo: salta il batch che satura la VRAM.
+            optimizer.zero_grad(set_to_none=True)
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+            print(f"[OOM] Batch saltato a step {step}. Prova batch_size/max_frames piu bassi.")
+            continue
 
         n_tokens = (decoder_target != tokenizer.pad_token_id).sum().item()
         total_loss += loss.item() * n_tokens
@@ -214,6 +236,7 @@ def train(
     mobilenet_lr: float = 1e-5,
     warmup_epochs: int = 2,
     unfreeze_epoch: int = 4,
+    use_amp: bool = True,
     # Modello
     d_model: int = 512,
     dropout: float = 0.1,
@@ -254,6 +277,10 @@ def train(
     total_steps  = num_epochs * len(loader)
     warmup_steps = warmup_epochs * len(loader)
     scheduler    = get_scheduler(optimizer, warmup_steps, total_steps)
+    amp_enabled = use_amp and device.type == 'cuda'
+    scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled) if amp_enabled else None
+    if amp_enabled:
+        print("[Training] AMP attivo (fp16 autocast + GradScaler).")
 
     tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
@@ -274,6 +301,7 @@ def train(
         metrics = train_epoch(
             model, loader, optimizer, scheduler,
             criterion, tokenizer, device, epoch, num_epochs,
+            amp_enabled, scaler,
         )
 
         epoch_time = time.time() - epoch_start
@@ -301,9 +329,10 @@ if __name__ == '__main__':
         landmarks_dir=Path('dataset/landmarks_normalized'),
         cropped_dir=Path('dataset/cropped'),
         checkpoint_dir=Path('checkpoints'),
-        num_samples=1000,  # Usa None per tutto il dataset
+        num_samples=1000,  # Usa None per tutto il dataset,
+        max_frames=96,  # Riduci se vai in OOM (es: 64)
         num_epochs=20,
-        batch_size=8,
+        batch_size=4,
         learning_rate=1e-4,
         mobilenet_lr=1e-5,
         warmup_epochs=2,
