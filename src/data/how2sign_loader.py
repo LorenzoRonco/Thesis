@@ -39,6 +39,7 @@ class How2SignDataset(Dataset):
         max_frames: int = 150,
         img_size: Tuple[int, int] = (224, 224),
         num_samples: Optional[int] = None,
+        require_video: bool = True,
     ):
         """
         Inizializza dataset.
@@ -48,23 +49,47 @@ class How2SignDataset(Dataset):
         self.cropped_dir = Path(cropped_dir)
         self.max_frames = max_frames
         self.img_size = img_size
+        self.require_video = require_video
         
         df = pd.read_csv(csv_path, sep='\t')
 
-        # Filtra solo i sample con file .npy esistente
-        df['npy_path'] = df['SENTENCE_NAME'].apply(
-            lambda name: self.landmarks_dir / f"{name}_landmarks.npy"
+        # I file landmark seguono il pattern:
+        #   {SENTENCE_ID}_{SENTENCE_NAME}_landmarks.npy
+        # es: --7E2sU6zP4_10_--7E2sU6zP4_10-5-rgb_front_landmarks.npy
+        df['npy_path'] = df.apply(
+            lambda row: self.landmarks_dir / f"{row['SENTENCE_ID']}_{row['SENTENCE_NAME']}_landmarks.npy",
+            axis=1,
         )
-        exists_mask = df['npy_path'].apply(lambda p: p.exists())
-        n_missing = (~exists_mask).sum()
-        if n_missing > 0:
-            print(f"[Dataset] {n_missing} file .npy mancanti, ignorati.")
+        df['video_path'] = df.apply(
+            lambda row: self.cropped_dir / f"{row['SENTENCE_ID']}_{row['SENTENCE_NAME']}_cropped.mp4",
+            axis=1,
+        )
 
-        self.df = df[exists_mask].reset_index(drop=True)
+        landmark_exists = df['npy_path'].apply(lambda p: p.exists())
+        n_missing_landmarks = int((~landmark_exists).sum())
+        if n_missing_landmarks > 0:
+            print(f"[Dataset] {n_missing_landmarks} file .npy mancanti, ignorati.")
+
+        if self.require_video:
+            video_exists = df['video_path'].apply(lambda p: p.exists())
+            n_missing_videos = int((~video_exists).sum())
+            if n_missing_videos > 0:
+                print(f"[Dataset] {n_missing_videos} video .mp4 mancanti, ignorati.")
+            valid_mask = landmark_exists & video_exists
+        else:
+            valid_mask = landmark_exists
+
+        self.df = df[valid_mask].reset_index(drop=True)
 
         if num_samples is not None:
             # iloc estrae intervalli di un dataframe
             self.df = self.df.iloc[:num_samples].reset_index(drop=True) 
+
+        if len(self.df) == 0:
+            raise ValueError(
+                "Nessun sample valido trovato. Verifica csv_path/landmarks_dir "
+                "e il naming dei file landmark."
+            )
 
         print(f"[Dataset] {len(self.df)} sample pronti.")
 
@@ -75,11 +100,7 @@ class How2SignDataset(Dataset):
         row = self.df.iloc[idx]
 
         landmarks, length = self._load_landmarks(row['npy_path'])
-        video_frames = self._load_video_frames(
-            sentence_id=row['SENTENCE_ID'],
-            sentence_name=row['SENTENCE_NAME'],
-            length=length
-        )
+        video_frames = self._load_video_frames(video_path=row['video_path'], length=length)
         sentence = row['SENTENCE']
 
         return landmarks, video_frames, sentence, length
@@ -106,23 +127,20 @@ class How2SignDataset(Dataset):
         return torch.from_numpy(data), length
 
 
-    def _load_video_frames(self, sentence_id: str, sentence_name: str, length: int) -> torch.Tensor:
+    def _load_video_frames(self, video_path: Path, length: int) -> torch.Tensor:
         """
         Carica frame da video .mp4 croppato.
 
         Args:
-            sentence_id  : es. --7E2sU6zP4_10
-            sentence_name: es. --7E2sU6zP4_10-5-rgb_front
-            length       : numero frame da caricare (allineato ai landmark)
+            video_path: path al file .mp4 croppato
+            length    : numero frame da caricare (allineato ai landmark)
 
         Returns:
             Tensor [length, 3, H, W]
         """
         
-        video_path = self.cropped_dir / f"{sentence_id}_{sentence_name}_cropped.mp4"
-
         if not video_path.exists():
-            print(f"⚠️  Video non trovato: {video_path.name}")
+            # Fallback utile se require_video=False.
             return torch.zeros(length, 3, *self.img_size)
 
         cap = cv2.VideoCapture(str(video_path))
@@ -147,6 +165,9 @@ class How2SignDataset(Dataset):
                 return torch.cat([torch.stack(frames), padding], dim=0)
             else:
                 return padding
+
+        # Caso standard: numero frame sufficiente.
+        return torch.stack(frames)
        
 # ----------------------------------------------------------------------
 # collate_fn — padding dinamico per batch
@@ -197,6 +218,7 @@ def create_dataloader(
     num_workers: int = 4,
     num_samples: Optional[int] = None,
     max_frames: Optional[int] = None,
+    require_video: bool = True,
 ) -> DataLoader:
     dataset = How2SignDataset(
         csv_path=csv_path,
@@ -204,6 +226,7 @@ def create_dataloader(
         cropped_dir=cropped_dir,
         max_frames=max_frames,
         num_samples=num_samples,
+        require_video=require_video,
     )
     return DataLoader(
         dataset,

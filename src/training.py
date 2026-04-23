@@ -206,6 +206,7 @@ def train(
     # Dati
     num_samples: int | None = None,
     max_frames: int = 150,
+    require_video: bool = True,
     # Training
     num_epochs: int = 20,
     batch_size: int = 8,
@@ -227,6 +228,7 @@ def train(
         cropped_dir=cropped_dir,
         max_frames=max_frames,
         num_samples=num_samples,
+        require_video=require_video,
     )
     print(f"[Training] {len(dataset)} sample di training.")
 
@@ -299,7 +301,7 @@ if __name__ == '__main__':
         landmarks_dir=Path('dataset/landmarks_normalized'),
         cropped_dir=Path('dataset/cropped'),
         checkpoint_dir=Path('checkpoints'),
-        num_samples=None,
+        num_samples=1000,  # Usa None per tutto il dataset
         num_epochs=20,
         batch_size=8,
         learning_rate=1e-4,
