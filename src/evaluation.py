@@ -6,7 +6,7 @@ ESECUZIONE
 ----------
 Dalla root del progetto:
 
-    python -m src.evaluate
+    python -m src.evaluation
 
 PERSONALIZZAZIONI
 -----------------
@@ -203,4 +203,5 @@ if __name__ == '__main__':
         num_samples=None,
         batch_size=8,
         max_new_tokens=100,
+        max_frames=64
     )

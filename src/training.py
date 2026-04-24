@@ -74,13 +74,9 @@ def freeze_mobilenet(model: SignLanguageTranslator):
     print("[Training] MobileNetV3 congelato.")
 
 
-def unfreeze_mobilenet(model: SignLanguageTranslator, lr: float, optimizer: torch.optim.Optimizer):
+def unfreeze_mobilenet(model: SignLanguageTranslator, lr: float):
     for param in model.cnn_branch.spatial_encoder.parameters():
         param.requires_grad = True
-    optimizer.add_param_group({
-        'params': model.cnn_branch.spatial_encoder.parameters(),
-        'lr': lr,
-    })
     print(f"[Training] MobileNetV3 sbloccato con lr={lr}.")
 
 
@@ -268,11 +264,21 @@ def train(
     model = SignLanguageTranslator(d_model=d_model, dropout=dropout).to(device)
     freeze_mobilenet(model)
 
-    trainable_params = [
+    main_params = [
         p for name, p in model.named_parameters()
-        if p.requires_grad and 'spatial_encoder' not in name
+        if 'spatial_encoder' not in name
     ]
-    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=1e-2)
+    mobilenet_params = [
+        p for name, p in model.named_parameters()
+        if 'spatial_encoder' in name
+    ]
+    optimizer = torch.optim.AdamW(
+        [
+            {'params': main_params, 'lr': learning_rate},
+            {'params': mobilenet_params, 'lr': mobilenet_lr},
+        ],
+        weight_decay=1e-2,
+    )
 
     total_steps  = num_epochs * len(loader)
     warmup_steps = warmup_epochs * len(loader)
@@ -294,7 +300,7 @@ def train(
         print(f"{'='*60}")
 
         if epoch == unfreeze_epoch:
-            unfreeze_mobilenet(model, mobilenet_lr, optimizer)
+            unfreeze_mobilenet(model, mobilenet_lr)
 
         epoch_start = time.time()
 
@@ -329,10 +335,10 @@ if __name__ == '__main__':
         landmarks_dir=Path('dataset/landmarks_normalized'),
         cropped_dir=Path('dataset/cropped'),
         checkpoint_dir=Path('checkpoints'),
-        num_samples=1000,  # Usa None per tutto il dataset,
-        max_frames=96,  # Riduci se vai in OOM (es: 64)
+        num_samples=5000,  # Usa None per tutto il dataset,
+        max_frames=64,  # Riduci se vai in OOM (es: 64)
         num_epochs=20,
-        batch_size=4,
+        batch_size=2,
         learning_rate=1e-4,
         mobilenet_lr=1e-5,
         warmup_epochs=2,
