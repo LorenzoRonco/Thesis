@@ -11,6 +11,7 @@ Output: dataset/landmarks_validation/
 
 import sys
 from pathlib import Path
+import argparse
 
 # Add src to path
 root_dir = Path(__file__).parent.parent
@@ -28,7 +29,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def extract_validation_landmarks():
+def extract_validation_landmarks(num_videos: int | None = None):
     """Extract landmarks from all validation videos."""
     
     validation_videos_dir = root_dir / "dataset" / "validation" / "raw_videos"
@@ -45,6 +46,8 @@ def extract_validation_landmarks():
     
     # Get all video files
     video_files = sorted(validation_videos_dir.glob("*.mp4"))
+    if num_videos is not None:
+        video_files = video_files[:num_videos]
     
     if not video_files:
         logger.warning(f"No .mp4 files found in {validation_videos_dir}")
@@ -94,4 +97,12 @@ def extract_validation_landmarks():
 
 
 if __name__ == '__main__':
-    extract_validation_landmarks()
+    parser = argparse.ArgumentParser(description="Extract landmarks from validation videos")
+    parser.add_argument(
+        '--num-videos',
+        type=int,
+        default=None,
+        help='Numero massimo di video da preprocessare.',
+    )
+    args = parser.parse_args()
+    extract_validation_landmarks(num_videos=args.num_videos)

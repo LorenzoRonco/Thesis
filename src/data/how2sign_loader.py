@@ -29,6 +29,9 @@ class How2SignDataset(Dataset):
         video_frames: Tensor [T, 3, 224, 224]  — frame RGB normalizzati
         sentence    : str                       — testo originale (tokenizzato fuori)
         length      : int                       — numero frame reali (senza padding)
+
+    Se max_frames e' impostato e un video ha T > max_frames, viene effettuato
+    un campionamento uniforme sull'intera sequenza (non un taglio dei primi frame).
     """
     
     def __init__(
@@ -92,75 +95,149 @@ class How2SignDataset(Dataset):
             )
 
         print(f"[Dataset] {len(self.df)} sample pronti.")
+        self._print_frame_length_summary()
 
     def __len__(self) -> int:
         return len(self.df)
 
+    def _print_frame_length_summary(self) -> None:
+        """
+        Stampa statistiche sui frame originali dei landmark e sui frame usati
+        dopo l'eventuale limitazione con max_frames.
+        """
+        frame_counts: List[int] = []
+        for npy_path in self.df['npy_path']:
+            try:
+                arr = np.load(npy_path, mmap_mode='r')
+                frame_counts.append(int(arr.shape[0]))
+            except Exception:
+                continue
+
+        if not frame_counts:
+            print("[Dataset] Statistiche frame non disponibili (nessun .npy leggibile).")
+            return
+
+        counts = np.asarray(frame_counts, dtype=np.int64)
+        p50 = int(np.percentile(counts, 50))
+        p90 = int(np.percentile(counts, 90))
+        p95 = int(np.percentile(counts, 95))
+        print(
+            "[Dataset] Frame originali (landmark): "
+            f"min={int(counts.min())}, p50={p50}, p90={p90}, p95={p95}, max={int(counts.max())}"
+        )
+
+        if self.max_frames is None:
+            print("[Dataset] max_frames=None: nessun downsampling temporale applicato.")
+            return
+
+        used_counts = np.minimum(counts, self.max_frames)
+        dropped_counts = counts - used_counts
+        truncated_mask = counts > self.max_frames
+        n_truncated = int(truncated_mask.sum())
+        pct_truncated = 100.0 * n_truncated / max(1, len(counts))
+        mean_dropped = float(dropped_counts.mean())
+        mean_dropped_truncated = (
+            float(dropped_counts[truncated_mask].mean()) if n_truncated > 0 else 0.0
+        )
+
+        print(
+            "[Dataset] Uso frame con max_frames="
+            f"{self.max_frames}: campioni oltre soglia={n_truncated}/{len(counts)} "
+            f"({pct_truncated:.1f}%), frame medi non usati={mean_dropped:.1f} "
+            f"(solo oltre soglia: {mean_dropped_truncated:.1f})."
+        )
+
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
 
-        landmarks, length = self._load_landmarks(row['npy_path'])
-        video_frames = self._load_video_frames(video_path=row['video_path'], length=length)
+        landmarks, frame_indices = self._load_landmarks(row['npy_path'])
+        video_frames = self._load_video_frames(video_path=row['video_path'], frame_indices=frame_indices)
+        length = landmarks.shape[0]
         sentence = row['SENTENCE']
 
         return landmarks, video_frames, sentence, length
 
     # ------------------------------------------------------------------
 
-    def _load_landmarks(self, npy_path: Path) -> Tuple[torch.Tensor, int]:
+    def _load_landmarks(self, npy_path: Path) -> Tuple[torch.Tensor, np.ndarray]:
         """
-        Carica e appiattisce i landmarks.
+        Carica e appiattisce i landmarks, con eventuale campionamento temporale.
 
         Returns:
-            landmarks : [T, 2108]
-            length    : numero frame reali (prima del taglio)
+            landmarks     : [T_sel, 2108]
+            frame_indices : indici frame selezionati rispetto alla sequenza originale
         """
         data = np.load(npy_path).astype(np.float32)  # [T, 527, 4]
         data = data.reshape(data.shape[0], -1)        # [T, 2108]
+        total_length = data.shape[0]
 
-        length = data.shape[0]
+        if self.max_frames is None or total_length <= self.max_frames:
+            frame_indices = np.arange(total_length, dtype=np.int64)
+        else:
+            # Copre l'intera sequenza in modo uniforme, evitando bias sui soli frame iniziali.
+            frame_indices = np.linspace(
+                0,
+                total_length - 1,
+                num=self.max_frames,
+                dtype=np.int64,
+            )
 
-        if self.max_frames is not None and length > self.max_frames:
-            data = data[:self.max_frames]
-            length = self.max_frames
+        data = data[frame_indices]
 
-        return torch.from_numpy(data), length
+        return torch.from_numpy(data), frame_indices
 
 
-    def _load_video_frames(self, video_path: Path, length: int) -> torch.Tensor:
+    def _load_video_frames(self, video_path: Path, frame_indices: np.ndarray) -> torch.Tensor:
         """
         Carica frame da video .mp4 croppato.
 
         Args:
             video_path: path al file .mp4 croppato
-            length    : numero frame da caricare (allineato ai landmark)
+            frame_indices: indici frame da estrarre (allineati ai landmark)
 
         Returns:
-            Tensor [length, 3, H, W]
+            Tensor [T_sel, 3, H, W]
         """
+        target_length = int(frame_indices.shape[0])
         
         if not video_path.exists():
             # Fallback utile se require_video=False.
-            return torch.zeros(length, 3, *self.img_size)
+            return torch.zeros(target_length, 3, *self.img_size)
 
         cap = cv2.VideoCapture(str(video_path))
+        video_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if target_length > 0 and video_total > 0 and int(frame_indices[-1]) >= video_total:
+            print(
+                "[Dataset][WARN] Possibile mismatch landmarks/video: "
+                f"{video_path.name} ha {video_total} frame, "
+                f"ma i landmarks richiedono indice massimo {int(frame_indices[-1])}."
+            )
         frames = []
+        wanted_ptr = 0
+        current_idx = 0
 
-        while len(frames) < length:
+        while wanted_ptr < target_length:
             ret, frame = cap.read()
             if not ret:
                 break
+
+            if current_idx != int(frame_indices[wanted_ptr]):
+                current_idx += 1
+                continue
+
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame = cv2.resize(frame, self.img_size)
             frame = frame.astype(np.float32) / 255.0
             frame = np.transpose(frame, (2, 0, 1))
             frames.append(torch.from_numpy(frame))
+            wanted_ptr += 1
+            current_idx += 1
 
         cap.release()
 
-        # Se il video ha meno frame dei landmark, padda con zeri
-        if len(frames) < length:
-            padding = torch.zeros(length - len(frames), 3, *self.img_size)
+        # Se il video ha meno frame del richiesto, padda con zeri
+        if len(frames) < target_length:
+            padding = torch.zeros(target_length - len(frames), 3, *self.img_size)
             if frames:
                 return torch.cat([torch.stack(frames), padding], dim=0)
             else:

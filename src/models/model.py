@@ -32,6 +32,7 @@ class SignLanguageTranslator(nn.Module):
         encoder_ffn_dim: int = 2048,
         # CNN Branch
         gru_layers: int = 2,
+        frame_chunk_size: int | None = 16,
         # Fusion
         fusion_deep_layers: int = 2,
         # Decoder
@@ -57,6 +58,7 @@ class SignLanguageTranslator(nn.Module):
             d_model=d_model,
             gru_layers=gru_layers,
             dropout=dropout,
+            frame_chunk_size=frame_chunk_size,
         )
 
         self.fusion = FusionModule(

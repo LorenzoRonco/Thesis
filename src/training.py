@@ -32,7 +32,10 @@ Modifica i parametri nel blocco `train(...)` in fondo al file:
                   Nelle prime epoche i pesi di MobileNetV3 sono congelati.
 
   max_frames    : numero massimo di frame per video (default: 150).
-                  Sequenze più lunghe vengono troncate.
+                  Sequenze più lunghe vengono campionate uniformemente.
+
+  frame_chunk_size: numero di frame processati per volta da MobileNet (default: 16).
+                  Riduce il picco VRAM senza perdere frame della sequenza.
 
   d_model       : dimensione interna del Transformer (default: 512).
                   Riduci a 256 per diminuire i parametri del modello.
@@ -236,6 +239,7 @@ def train(
     # Modello
     d_model: int = 512,
     dropout: float = 0.1,
+    frame_chunk_size: int | None = 16,
 ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"[Training] Device: {device}")
@@ -261,7 +265,11 @@ def train(
     )
 
     # --- Modello ----------------------------------------------------------
-    model = SignLanguageTranslator(d_model=d_model, dropout=dropout).to(device)
+    model = SignLanguageTranslator(
+        d_model=d_model,
+        dropout=dropout,
+        frame_chunk_size=frame_chunk_size,
+    ).to(device)
     freeze_mobilenet(model)
 
     main_params = [
@@ -335,12 +343,13 @@ if __name__ == '__main__':
         landmarks_dir=Path('dataset/landmarks_normalized'),
         cropped_dir=Path('dataset/cropped'),
         checkpoint_dir=Path('checkpoints'),
-        num_samples=5000,  # Usa None per tutto il dataset,
+        num_samples=2,  # Usa None per tutto il dataset,
         max_frames=64,  # Riduci se vai in OOM (es: 64)
-        num_epochs=20,
+        num_epochs=1,
         batch_size=2,
         learning_rate=1e-4,
         mobilenet_lr=1e-5,
         warmup_epochs=2,
         unfreeze_epoch=4,
+        frame_chunk_size=16,
     )

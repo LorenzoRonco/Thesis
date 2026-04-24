@@ -21,8 +21,10 @@ class CNNBranch(nn.Module):
         d_model: int = 512,
         gru_layers: int = 2,
         dropout: float = 0.1,
+        frame_chunk_size: int | None = 16,
     ):
         super().__init__()
+        self.frame_chunk_size = frame_chunk_size
 
         # ------------------------------------------------------------------
         # 2D-CNN: MobileNetV3 Large pretrained
@@ -87,11 +89,18 @@ class CNNBranch(nn.Module):
         """
         B, T, C, H, W = x.shape
 
-        # --- MobileNetV3: processa tutti i frame in parallelo --------------
-        # Fonde B e T in una unica dimensione batch per passarli insieme
-        # perchè mobilenet è fatta per processare immagini singole
+        # --- MobileNetV3: processa i frame in chunk per ridurre il picco VRAM
+        # Mantiene tutta la sequenza temporale, ma evita il batch B*T in un colpo solo.
         x = x.view(B * T, C, H, W)          # [B*T, 3, 224, 224]
-        x = self.spatial_encoder(x)          # [B*T, 960]
+        if self.frame_chunk_size is None or self.frame_chunk_size <= 0:
+            x = self.spatial_encoder(x)      # [B*T, 960]
+        else:
+            chunks = []
+            for start in range(0, x.size(0), self.frame_chunk_size):
+                end = min(start + self.frame_chunk_size, x.size(0))
+                chunks.append(self.spatial_encoder(x[start:end]))
+            x = torch.cat(chunks, dim=0)     # [B*T, 960]
+
         x = x.view(B, T, -1)                 # [B, T, 960]
 
         # --- 1D-CNN: pattern temporali locali ------------------------------

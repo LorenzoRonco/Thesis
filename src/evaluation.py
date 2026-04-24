@@ -55,13 +55,18 @@ def load_model(
     d_model: int,
     dropout: float,
     device: torch.device,
+    frame_chunk_size: int | None,
 ) -> SignLanguageTranslator:
     """
     Carica il modello da checkpoint.
     Gestisce sia best_model.pt (solo state_dict)
     che checkpoint_epoch_XXX.pt (dict completo).
     """
-    model = SignLanguageTranslator(d_model=d_model, dropout=dropout).to(device)
+    model = SignLanguageTranslator(
+        d_model=d_model,
+        dropout=dropout,
+        frame_chunk_size=frame_chunk_size,
+    ).to(device)
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
@@ -98,6 +103,7 @@ def evaluate(
     # Modello
     d_model: int = 512,
     dropout: float = 0.1,
+    frame_chunk_size: int | None = 16,
 ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"[Evaluate] Device: {device}")
@@ -122,7 +128,7 @@ def evaluate(
     )
 
     # --- Modello ----------------------------------------------------------
-    model = load_model(checkpoint_path, d_model, dropout, device)
+    model = load_model(checkpoint_path, d_model, dropout, device, frame_chunk_size)
 
     tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)

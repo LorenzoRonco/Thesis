@@ -10,6 +10,7 @@ import logging
 from pathlib import Path
 from typing import List, Tuple
 import sys
+import argparse
 
 # Configurazione logging
 logging.basicConfig(
@@ -22,7 +23,14 @@ logger = logging.getLogger(__name__)
 class VideoSegmenter:
     """Classe per segmentare i video basandosi su un file CSV."""
     
-    def __init__(self, csv_path: str, video_dir: str, output_dir: str):
+    def __init__(
+        self,
+        csv_path: str,
+        video_dir: str,
+        output_dir: str,
+        target_fps: float | None = None,
+        target_height: int | None = None,
+    ):
         """
         Inizializza il segmentatore.
         
@@ -34,6 +42,8 @@ class VideoSegmenter:
         self.csv_path = csv_path
         self.video_dir = Path(video_dir)
         self.output_dir = Path(output_dir)
+        self.target_fps = target_fps
+        self.target_height = target_height
         
         # Crea la cartella output se non esiste
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -44,6 +54,13 @@ class VideoSegmenter:
         
         # Verifica che ffmpeg sia disponibile
         self._check_ffmpeg()
+
+        if self.target_fps is not None or self.target_height is not None:
+            logger.info(
+                "Preprocessing output attivo: target_fps=%s, target_height=%s",
+                self.target_fps,
+                self.target_height,
+            )
     
     def _check_ffmpeg(self) -> bool:
         """Verifica che ffmpeg sia installato."""
@@ -99,18 +116,42 @@ class VideoSegmenter:
         try:
             # Costruisce il comando ffmpeg
             # -ss start_time: da questo tempo
-            # -to end_time: a questo tempo
-            # -c:v copy -c:a copy: copia gli stream senza riencodare (più veloce)
+            # -to duration: per questa durata
             cmd = [
                 'ffmpeg',
                 '-ss', str(start_time),
                 '-i', str(video_path),
                 '-to', str(end_time - start_time),
-                '-c:v', 'copy',
-                '-c:a', 'copy',
+            ]
+
+            vf_filters = []
+            if self.target_fps is not None:
+                vf_filters.append(f"fps={self.target_fps}")
+            if self.target_height is not None:
+                # Mantiene aspect ratio; width multipla di 2 per codec H.264
+                vf_filters.append(f"scale=-2:{self.target_height}")
+
+            if vf_filters:
+                # Se applichiamo filtri temporali/spaziali, serve re-encoding.
+                cmd.extend([
+                    '-vf', ','.join(vf_filters),
+                    '-c:v', 'libx264',
+                    '-preset', 'fast',
+                    '-crf', '23',
+                    '-c:a', 'aac',
+                    '-b:a', '128k',
+                ])
+            else:
+                # Nessun preprocessing: copia stream senza ricodifica.
+                cmd.extend([
+                    '-c:v', 'copy',
+                    '-c:a', 'copy',
+                ])
+
+            cmd.extend([
                 '-y',  # Sovrascrivi file esistenti
                 str(output_path)
-            ]
+            ])
             
             # Esegui il comando
             subprocess.run(cmd, 
@@ -130,7 +171,7 @@ class VideoSegmenter:
             logger.error(f"Errore sconosciuto: {e}")
             return False
     
-    def process_all(self, verbose: bool = True) -> Tuple[int, int]:
+    def process_all(self, verbose: bool = True, num_videos: int | None = None) -> Tuple[int, int]:
         """
         Processa tutte le segmentazioni dal CSV.
         
@@ -145,6 +186,9 @@ class VideoSegmenter:
         
         # Raggruppa per video per efficienza
         grouped = self.df.groupby('VIDEO_NAME')
+        if num_videos is not None:
+            selected_videos = self.df['VIDEO_NAME'].drop_duplicates().iloc[:num_videos]
+            grouped = grouped.filter(lambda g: g.name in set(selected_videos)).groupby('VIDEO_NAME')
         total_videos = len(grouped)
         
         for video_idx, (video_name, group) in enumerate(grouped, 1):
@@ -234,20 +278,58 @@ class VideoSegmenter:
     
     def get_statistics(self):
         """Stampa statistiche sul dataset."""
+        durations = self.df['END_REALIGNED'] - self.df['START_REALIGNED']
         print("\n" + "="*60)
         print("STATISTICHE DATASET")
         print("="*60)
         print(f"Segmentazioni totali: {len(self.df)}")
         print(f"Video unici: {self.df['VIDEO_NAME'].nunique()}")
         print(f"Frasi totali: {self.df['SENTENCE_ID'].nunique()}")
-        print(f"\nDurata medio segmentazione: {(self.df['END_REALIGNED'] - self.df['START_REALIGNED']).mean():.2f}s")
-        print(f"Durata min segmentazione: {(self.df['END_REALIGNED'] - self.df['START_REALIGNED']).min():.2f}s")
-        print(f"Durata max segmentazione: {(self.df['END_REALIGNED'] - self.df['START_REALIGNED']).max():.2f}s")
+        print(f"\nDurata medio segmentazione: {durations.mean():.2f}s")
+        print(f"Durata min segmentazione: {durations.min():.2f}s")
+        print(f"Durata max segmentazione: {durations.max():.2f}s")
+        if self.target_fps is not None:
+            expected_frames = durations * self.target_fps
+            print(f"\nCon target_fps={self.target_fps:g}:")
+            print(f"Frame medi per segmento (stimati): {expected_frames.mean():.1f}")
+            print(f"Frame p50 per segmento (stimati): {expected_frames.quantile(0.5):.1f}")
+            print(f"Frame p90 per segmento (stimati): {expected_frames.quantile(0.9):.1f}")
+            print(f"Frame max per segmento (stimati): {expected_frames.max():.1f}")
         print("="*60 + "\n")
 
 
 def main():
     """Funzione principale."""
+    parser = argparse.ArgumentParser(
+        description="Segmenta i video How2Sign in base ai timestamp CSV."
+    )
+    parser.add_argument(
+        'mode',
+        nargs='?',
+        default='sample',
+        choices=['sample', 'test', 'full'],
+        help="sample/test per debug veloce, full per tutto il dataset",
+    )
+    parser.add_argument(
+        '--target-fps',
+        type=float,
+        default=None,
+        help="FPS output desiderati (es. 30 o 25). Se omesso, mantiene stream originale.",
+    )
+    parser.add_argument(
+        '--target-height',
+        type=int,
+        default=None,
+        help="Altezza output video (es. 480). Larghezza adattata mantenendo aspect ratio.",
+    )
+    parser.add_argument(
+        '--num-videos',
+        type=int,
+        default=None,
+        help="Numero massimo di video distinti da preprocessare.",
+    )
+    args = parser.parse_args()
+
     # Configurazione percorsi (sali 3 livelli: preprocessing -> src -> root)
     root_dir = Path(__file__).parent.parent.parent
     csv_path = root_dir / "dataset" / "how2sign_realigned_train.csv"
@@ -260,20 +342,27 @@ def main():
         sys.exit(1)
     
     # Crea il segmentatore
-    segmenter = VideoSegmenter(str(csv_path), str(video_dir), str(output_dir))
+    segmenter = VideoSegmenter(
+        str(csv_path),
+        str(video_dir),
+        str(output_dir),
+        target_fps=args.target_fps,
+        target_height=args.target_height,
+    )
     
     # Mostra statistiche
     segmenter.get_statistics()
     
     # Modo: scegli tra 'sample' per un test o 'full' per tutto
-    mode = 'sample' if len(sys.argv) < 2 else sys.argv[1]
+    mode = args.mode
     
     if mode == 'test' or mode == 'sample':
-        logger.info("\n🔍 Avviando in MODALITÀ TEST (primi 2 video)")
-        success, errors = segmenter.process_sample(num_videos=2)
+        sample_videos = args.num_videos if args.num_videos is not None else 2
+        logger.info(f"\n🔍 Avviando in MODALITÀ TEST (primi {sample_videos} video)")
+        success, errors = segmenter.process_sample(num_videos=sample_videos)
     else:
         logger.info("\n▶️ Avviando processamento COMPLETO")
-        success, errors = segmenter.process_all()
+        success, errors = segmenter.process_all(num_videos=args.num_videos)
     
     # Risultati finali
     print("\n" + "="*60)
