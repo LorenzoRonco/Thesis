@@ -12,6 +12,7 @@ Output: dataset/segmented_validation/
 
 import sys
 from pathlib import Path
+import argparse
 
 # Add src to path
 root_dir = Path(__file__).parent.parent
@@ -22,6 +23,36 @@ from preprocessing.video_segmentation import VideoSegmenter
 
 def main():
     """Segment validation videos based on the validation CSV."""
+    parser = argparse.ArgumentParser(
+        description="Segmenta i video di validation in base al CSV realigned."
+    )
+    parser.add_argument(
+        'mode',
+        nargs='?',
+        default='sample',
+        choices=['sample', 'test', 'full'],
+        help="sample/test per debug veloce, full per tutto il dataset",
+    )
+    parser.add_argument(
+        '--target-fps',
+        type=float,
+        default=None,
+        help="FPS output desiderati (es. 30 o 25). Se omesso, mantiene stream originale.",
+    )
+    parser.add_argument(
+        '--target-height',
+        type=int,
+        default=None,
+        help="Altezza output video (es. 480). Larghezza adattata mantenendo aspect ratio.",
+    )
+    parser.add_argument(
+        '--num-videos',
+        type=int,
+        default=None,
+        help="Numero massimo di video distinti da preprocessare.",
+    )
+    args = parser.parse_args()
+
     csv_path = root_dir / "dataset" / "how2sign_realigned_val.csv"
     video_dir = root_dir / "dataset" / "validation" / "raw_videos"
     output_dir = root_dir / "dataset" / "segmented_validation"
@@ -34,16 +65,23 @@ def main():
         print(f"ERROR: Cartella video non trovata: {video_dir}")
         sys.exit(1)
 
-    segmenter = VideoSegmenter(str(csv_path), str(video_dir), str(output_dir))
+    segmenter = VideoSegmenter(
+        str(csv_path),
+        str(video_dir),
+        str(output_dir),
+        target_fps=args.target_fps,
+        target_height=args.target_height,
+    )
     segmenter.get_statistics()
 
-    mode = 'sample' if len(sys.argv) < 2 else sys.argv[1]
+    mode = args.mode
     if mode in ('test', 'sample'):
-        print("\n🔍 Avviando in MODALITA TEST (primi 2 video)")
-        success, errors = segmenter.process_sample(num_videos=2)
+        sample_videos = args.num_videos if args.num_videos is not None else 2
+        print(f"\n🔍 Avviando in MODALITA TEST (primi {sample_videos} video)")
+        success, errors = segmenter.process_sample(num_videos=sample_videos)
     else:
         print("\n▶️ Avviando processamento COMPLETO")
-        success, errors = segmenter.process_all()
+        success, errors = segmenter.process_all(num_videos=args.num_videos)
 
     print("\n" + "=" * 60)
     print("RISULTATI")

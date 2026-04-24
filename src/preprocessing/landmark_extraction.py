@@ -223,7 +223,7 @@ class LandmarkExtractor:
             self.landmarker.close()
 
 
-def process_all_videos(input_dir, output_dir, model_path=None, use_gpu=True):
+def process_all_videos(input_dir, output_dir, model_path=None, use_gpu=True, num_videos: int | None = None):
     """
     Process all videos in input directory and save landmarks.
     
@@ -239,6 +239,8 @@ def process_all_videos(input_dir, output_dir, model_path=None, use_gpu=True):
     
     # Find all video files
     video_files = sorted(input_dir.glob("*.mp4"))
+    if num_videos is not None:
+        video_files = video_files[:num_videos]
     
     if not video_files:
         logger.error(f"No MP4 files found in {input_dir}")
@@ -310,6 +312,12 @@ def main():
         action="store_true",
         help="Use CPU instead of GPU for inference (default: use GPU)",
     )
+    parser.add_argument(
+        "--num-videos",
+        type=int,
+        default=None,
+        help="Numero massimo di video da preprocessare.",
+    )
     args = parser.parse_args()
 
     # Determine paths relative to this file
@@ -330,7 +338,13 @@ def main():
     logger.info(f"Using device: {device_info}")
     
     # Process all videos
-    process_all_videos(segmented_dir, landmarks_dir, model_path=args.model_path, use_gpu=use_gpu)
+    process_all_videos(
+        segmented_dir,
+        landmarks_dir,
+        model_path=args.model_path,
+        use_gpu=use_gpu,
+        num_videos=args.num_videos,
+    )
 
 
 if __name__ == "__main__":
