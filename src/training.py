@@ -12,35 +12,46 @@ PERSONALIZZAZIONI
 -----------------
 Modifica i parametri nel blocco `train(...)` in fondo al file:
 
-  num_samples   : numero di video da usare per il training.
-                  None = tutto il dataset.
+  num_samples     : numero di video da usare per il training.
+                    None = tutto il dataset.
 
-  num_epochs    : numero di epoche di training (default: 20).
+  num_epochs      : numero di epoche di training (default: 20).
 
-  batch_size    : numero di sample per batch (default: 8).
-                  Riduci a 4 se vai in out-of-memory sulla GPU.
+  batch_size      : numero di sample per batch (default: 8).
+                    Riduci a 4 se vai in out-of-memory sulla GPU.
 
-  learning_rate : lr per tutti i moduli tranne MobileNetV3 (default: 1e-4).
+  learning_rate   : lr per tutti i moduli tranne MobileNetV3 (default: 1e-4).
 
-  mobilenet_lr  : lr applicato a MobileNetV3 quando viene sbloccato (default: 1e-5).
-                  Più basso del lr principale perché i pesi sono già pretrained.
+  mobilenet_lr    : lr applicato a MobileNetV3 quando viene sbloccato (default: 1e-5).
+                    Più basso del lr principale perché i pesi sono già pretrained.
 
-  warmup_epochs : epoche di warmup del learning rate (default: 2).
-                  Durante il warmup il lr sale linearmente fino al valore base.
+  warmup_epochs   : epoche di warmup del learning rate (default: 2).
+                    Durante il warmup il lr sale linearmente fino al valore base.
 
-  unfreeze_epoch: epoca a cui MobileNetV3 viene sbloccato per il fine-tuning (default: 4).
-                  Nelle prime epoche i pesi di MobileNetV3 sono congelati.
+  unfreeze_epoch  : epoca a cui MobileNetV3 viene sbloccato per il fine-tuning (default: 4).
+                    Nelle prime epoche i pesi di MobileNetV3 sono congelati.
 
-  max_frames    : numero massimo di frame per video (default: 150).
-                  Sequenze più lunghe vengono campionate uniformemente.
+  max_frames      : numero massimo di frame per video (default: 150).
+                    Sequenze più lunghe vengono campionate uniformemente.
 
   frame_chunk_size: numero di frame processati per volta da MobileNet (default: 16).
-                  Riduce il picco VRAM senza perdere frame della sequenza.
+                    Riduce il picco VRAM senza perdere frame della sequenza.
 
-  d_model       : dimensione interna del Transformer (default: 512).
-                  Riduci a 256 per diminuire i parametri del modello.
+  d_model         : dimensione interna del Transformer (default: 512).
+                    Riduci a 256 per diminuire i parametri del modello.
 
-  dropout       : dropout globale (default: 0.1).
+  dropout         : dropout globale (default: 0.1).
+
+  label_smoothing : valore di label smoothing nella loss (default: 0.1).
+                    Riduce la confidenza eccessiva del modello sulle frasi memorizzate.
+                    0.0 = nessun smoothing, 0.1 = valore consigliato.
+
+  max_sampling_rate: probabilità massima di scheduled sampling (default: 0.5).
+                    A ogni epoca la probabilità sale di sampling_rate_step fino
+                    a questo valore. 0.0 = solo teacher forcing (comportamento originale).
+
+  sampling_rate_step: incremento di scheduled sampling per epoca (default: 0.05).
+                    Con il default: 0% epoca 1, 5% epoca 2, ..., 50% epoca 10+.
 
 CHECKPOINTS
 -----------
@@ -48,6 +59,7 @@ Salvati in checkpoints/ ad ogni epoca.
 Le metriche di ogni epoca sono disponibili in checkpoints/metrics_epoch_XXX.json.
 """
 
+import random
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -132,6 +144,7 @@ def train_epoch(
     num_epochs: int,
     use_amp: bool,
     scaler: torch.amp.GradScaler | None,
+    sampling_rate: float,
 ) -> dict:
     model.train()
     total_loss = 0.0
@@ -153,10 +166,40 @@ def train_epoch(
         )
         target_tokens = encoded['input_ids'].to(device)  # [B, L]
 
-        # Input decoder: tutti i token tranne l'ultimo
-        # Target loss:   tutti i token tranne il primo (BOS)
-        decoder_input  = target_tokens[:, :-1]  # [B, L-1]
-        decoder_target = target_tokens[:, 1:]   # [B, L-1]
+        # --- Scheduled sampling -------------------------------------------
+        # Con probabilità sampling_rate usiamo i token generati dal modello
+        # invece di quelli corretti come input al decoder.
+        # Questo riduce l'exposure bias e migliora la generalizzazione.
+        if sampling_rate > 0.0 and random.random() < sampling_rate:
+            with torch.no_grad():
+                # Genera le traduzioni con il modello corrente
+                generated = model.generate(
+                    landmarks=landmarks,
+                    video_frames=video_frames,
+                    padding_mask=padding_mask,
+                    max_new_tokens=target_tokens.size(1),
+                )
+                # Ri-tokenizza le predizioni per usarle come input al decoder
+                encoded_pred = tokenizer(
+                    generated,
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                    return_tensors='pt',
+                )
+                decoder_input = encoded_pred['input_ids'][:, :-1].to(device)
+        else:
+            # Teacher forcing standard: input = token corretti tranne l'ultimo
+            decoder_input = target_tokens[:, :-1]   # [B, L-1]
+
+        # Target della loss: tutti i token tranne il primo (BOS)
+        decoder_target = target_tokens[:, 1:]        # [B, L-1]
+
+        # Allinea decoder_input e decoder_target alla stessa lunghezza
+        # (necessario quando scheduled sampling produce sequenze più corte)
+        min_len = min(decoder_input.size(1), decoder_target.size(1))
+        decoder_input  = decoder_input[:, :min_len]
+        decoder_target = decoder_target[:, :min_len]
 
         optimizer.zero_grad(set_to_none=True)
         amp_ctx = torch.autocast(device_type='cuda', dtype=torch.float16) if use_amp else nullcontext()
@@ -187,8 +230,8 @@ def train_epoch(
                 optimizer.step()
 
             scheduler.step()
+
         except torch.OutOfMemoryError:
-            # Evita il crash completo: salta il batch che satura la VRAM.
             optimizer.zero_grad(set_to_none=True)
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
@@ -208,6 +251,7 @@ def train_epoch(
                 f"Step {step}/{len(loader)} | "
                 f"Loss: {avg_loss:.4f} | "
                 f"LR: {current_lr:.2e} | "
+                f"Sampling: {sampling_rate:.0%} | "
                 f"Tempo: {format_time(elapsed)}"
             )
 
@@ -236,9 +280,13 @@ def train(
     warmup_epochs: int = 2,
     unfreeze_epoch: int = 4,
     use_amp: bool = True,
+    # Scheduled sampling
+    max_sampling_rate: float = 0.5,
+    sampling_rate_step: float = 0.05,
     # Modello
     d_model: int = 512,
     dropout: float = 0.1,
+    label_smoothing: float = 0.1,
     frame_chunk_size: int | None = 16,
 ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -291,13 +339,21 @@ def train(
     total_steps  = num_epochs * len(loader)
     warmup_steps = warmup_epochs * len(loader)
     scheduler    = get_scheduler(optimizer, warmup_steps, total_steps)
+
     amp_enabled = use_amp and device.type == 'cuda'
     scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled) if amp_enabled else None
     if amp_enabled:
         print("[Training] AMP attivo (fp16 autocast + GradScaler).")
 
     tokenizer = BartTokenizer.from_pretrained('facebook/bart-base')
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+
+    # Label smoothing: distribuisce una piccola probabilità sugli altri token,
+    # riducendo la confidenza eccessiva del modello sulle frasi memorizzate.
+    criterion = nn.CrossEntropyLoss(
+        ignore_index=tokenizer.pad_token_id,
+        label_smoothing=label_smoothing,
+    )
+    print(f"[Training] Label smoothing: {label_smoothing}")
 
     # --- Loop -------------------------------------------------------------
     best_loss = float('inf')
@@ -310,23 +366,28 @@ def train(
         if epoch == unfreeze_epoch:
             unfreeze_mobilenet(model, mobilenet_lr)
 
+        # Scheduled sampling: aumenta gradualmente la probabilità di usare
+        # i token generati invece di quelli corretti come input al decoder.
+        sampling_rate = min(max_sampling_rate, (epoch - 1) * sampling_rate_step)
+        print(f"  Scheduled sampling: {sampling_rate:.0%}")
+
         epoch_start = time.time()
 
         metrics = train_epoch(
             model, loader, optimizer, scheduler,
             criterion, tokenizer, device, epoch, num_epochs,
-            amp_enabled, scaler,
+            amp_enabled, scaler, sampling_rate,
         )
 
         epoch_time = time.time() - epoch_start
         metrics['epoch_time'] = format_time(epoch_time)
+        metrics['sampling_rate'] = sampling_rate
 
         print(f"\n  Tempo epoca : {format_time(epoch_time)}")
         print(f"  Train Loss  : {metrics['train_loss']:.4f}")
 
         save_checkpoint(model, optimizer, epoch, metrics, checkpoint_dir)
 
-        # Salva il modello con loss migliore
         if metrics['train_loss'] < best_loss:
             best_loss = metrics['train_loss']
             torch.save(model.state_dict(), checkpoint_dir / 'best_model.pt')
@@ -343,8 +404,8 @@ if __name__ == '__main__':
         landmarks_dir=Path('dataset/landmarks_normalized'),
         cropped_dir=Path('dataset/cropped'),
         checkpoint_dir=Path('checkpoints'),
-        num_samples=2,  # Usa None per tutto il dataset,
-        max_frames=64,  # Riduci se vai in OOM (es: 64)
+        num_samples=2,       # Usa None per tutto il dataset
+        max_frames=64,       # Riduci se vai in OOM (es: 64)
         num_epochs=1,
         batch_size=2,
         learning_rate=1e-4,
@@ -352,4 +413,7 @@ if __name__ == '__main__':
         warmup_epochs=2,
         unfreeze_epoch=4,
         frame_chunk_size=16,
+        label_smoothing=0.1,
+        max_sampling_rate=0.5,
+        sampling_rate_step=0.05,
     )
