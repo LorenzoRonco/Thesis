@@ -331,7 +331,8 @@ def build_tokenizer(
 def build_dataloaders(
     train_csv:     str | Path,
     val_csv:       str | Path,
-    landmarks_dir: str | Path,
+    train_landmarks_dir: str | Path,
+    val_landmarks_dir: str | Path,
     tokenizer:     SentenceTokenizer,
     batch_size:    int = 32,
     num_workers:   int = 4,
@@ -339,6 +340,7 @@ def build_dataloaders(
     max_tgt_len:   int = 128,
     pin_memory:    bool = True,
     test_csv:      Optional[str | Path] = None,
+    test_landmarks_dir: Optional[str | Path] = None,
 ) -> dict[str, DataLoader]:
     """
     Restituisce un dizionario {"train": ..., "val": ..., "test": ...}.
@@ -346,10 +348,10 @@ def build_dataloaders(
     from functools import partial
     _collate = partial(collate_fn, pad_id=tokenizer.pad_id)
 
-    def _make_loader(csv_path, shuffle):
+    def _make_loader(csv_path, shuffle, lm_dir):
         ds = How2SignDataset(
             csv_path=csv_path,
-            landmarks_dir=landmarks_dir,
+            landmarks_dir=lm_dir,
             tokenizer=tokenizer,
             max_src_len=max_src_len,
             max_tgt_len=max_tgt_len,
@@ -365,10 +367,14 @@ def build_dataloaders(
         )
 
     loaders = {
-        "train": _make_loader(train_csv,  shuffle=True),
-        "val":   _make_loader(val_csv,         shuffle=False),
+        "train": _make_loader(train_csv,  shuffle=True,  lm_dir=train_landmarks_dir),
+        "val":   _make_loader(val_csv,         shuffle=False, lm_dir=val_landmarks_dir),
     }
     if test_csv:
-        loaders["test"] = _make_loader(test_csv, shuffle=False)
+        loaders["test"] = _make_loader(
+            test_csv,
+            shuffle=False,
+            lm_dir=test_landmarks_dir or val_landmarks_dir,
+        )
 
     return loaders

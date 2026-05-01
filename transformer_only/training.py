@@ -19,11 +19,11 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 
 from transformer_only.data.how2sign_loader import build_tokenizer, build_dataloaders, SentenceTokenizer
 from transformer_only.models import SignLanguageTransformer
-from evaluate import compute_bleu, decode_batch          # definito in evaluate.py
+from transformer_only.evaluate import compute_bleu, decode_batch          # definito in evaluate.py
 
 
 # ──────────────────────────────────────────────
@@ -56,12 +56,17 @@ def train_epoch(
     device:    torch.device,
     clip_norm: float,
     use_amp:   bool,
+    log_interval: int,
 ) -> dict:
     model.train()
     total_loss  = 0.0
     total_tok   = 0
     total_steps = 0
     t0          = time.time()
+
+    amp_device = "cuda" if device.type == "cuda" else "cpu"
+
+    last_log_time = time.time()
 
     for batch in loader:
         src      = batch["src"].to(device, non_blocking=True)
@@ -72,7 +77,7 @@ def train_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast(enabled=use_amp):
+        with autocast(amp_device, enabled=use_amp):
             _, loss = model(
                 src=src,
                 tgt_input=tgt_in,
@@ -93,6 +98,17 @@ def train_epoch(
         total_loss  += loss.item() * n_tok
         total_tok   += n_tok
         total_steps += 1
+
+        if log_interval and total_steps % log_interval == 0:
+            elapsed = time.time() - last_log_time
+            avg_loss = total_loss / max(1, total_tok)
+            print(
+                f"    step {total_steps:5d}/{len(loader):5d}  "
+                f"loss={avg_loss:.4f}  "
+                f"lr={optimizer.param_groups[0]['lr']:.2e}  "
+                f"{elapsed:.1f}s"
+            )
+            last_log_time = time.time()
 
     avg_loss = total_loss / max(1, total_tok)
     ppl      = math.exp(min(avg_loss, 20))
@@ -118,6 +134,8 @@ def validate(
     all_hyps   = []
     all_refs   = []
 
+    amp_device = "cuda" if device.type == "cuda" else "cpu"
+
     for batch in loader:
         src      = batch["src"].to(device, non_blocking=True)
         tgt_in   = batch["tgt_input"].to(device, non_blocking=True)
@@ -125,7 +143,7 @@ def validate(
         src_mask = batch["src_key_padding_mask"].to(device, non_blocking=True)
         tin_mask = batch["tgt_in_key_padding_mask"].to(device, non_blocking=True)
 
-        with autocast(enabled=use_amp):
+        with autocast(amp_device, enabled=use_amp):
             _, loss = model(
                 src=src,
                 tgt_input=tgt_in,
@@ -214,7 +232,9 @@ def main(cfg: dict):
     loaders = build_dataloaders(
         train_csv     = cfg["train_csv"],
         val_csv       = cfg["val_csv"],
-        landmarks_dir = cfg["landmarks_dir"],
+        train_landmarks_dir = cfg.get("train_landmarks_dir"),
+        val_landmarks_dir   = cfg.get("val_landmarks_dir"),
+        test_landmarks_dir  = cfg.get("test_landmarks_dir"),
         tokenizer     = tokenizer,
         batch_size    = cfg["batch_size"],
         num_workers   = cfg["num_workers"],
@@ -254,7 +274,7 @@ def main(cfg: dict):
         weight_decay = cfg["weight_decay"],
     )
     scheduler = WarmupCosineScheduler(optimizer, warmup_steps, total_steps)
-    scaler    = GradScaler(enabled=use_amp)
+    scaler    = GradScaler("cuda", enabled=use_amp)
 
     # ── Resume ────────────────────────────────
     start_epoch = 0
@@ -281,7 +301,7 @@ def main(cfg: dict):
 
         train_stats = train_epoch(
             model, loaders["train"], optimizer, scheduler,
-            scaler, device, cfg["clip_norm"], use_amp,
+            scaler, device, cfg["clip_norm"], use_amp, cfg["log_interval"],
         )
         print(
             f"  TRAIN  loss={train_stats['loss']:.4f}  "
@@ -338,21 +358,19 @@ if __name__ == "__main__":
     parser.add_argument("--train_csv",     type=str)
     parser.add_argument("--val_csv",       type=str)
     parser.add_argument("--test_csv",      type=str, default=None)
-    parser.add_argument("--landmarks_dir", type=str)
     parser.add_argument("--output_dir",    type=str, default="outputs/run1")
-    parser.add_argument("--epochs",        type=int, default=100)
-    parser.add_argument("--batch_size",    type=int, default=32)
     parser.add_argument("--lr",            type=float, default=1e-4)
-    parser.add_argument("--resume",        action="store_true")
-    parser.add_argument("--use_wandb",     action="store_true")
     args = parser.parse_args()
 
     # Config di default
     cfg = {
-        "train_csv":     args.train_csv,
-        "val_csv":       args.val_csv,
+        # Dataset paths (edit here)
+        "train_csv":     args.train_csv or "dataset/how2sign_realigned_train.csv",
+        "val_csv":       args.val_csv or "dataset/how2sign_realigned_val.csv",
         "test_csv":      args.test_csv,
-        "landmarks_dir": args.landmarks_dir,
+        "train_landmarks_dir": "dataset/landmarks_normalized",
+        "val_landmarks_dir":   "dataset/landmarks_validation_normalized",
+        "test_landmarks_dir":  None,
         "output_dir":    args.output_dir,
         "device":        "cuda",
         "use_amp":       True,
@@ -368,16 +386,17 @@ if __name__ == "__main__":
         "max_src_len":    512,
         "max_tgt_len":    128,
         # training
-        "epochs":         args.epochs,
-        "batch_size":     args.batch_size,
+        "epochs":         100,
+        "batch_size":     32,
         "lr":             args.lr,
         "weight_decay":   1e-4,
         "clip_norm":      1.0,
         "warmup_steps":   4000,
         "num_workers":    4,
-        "resume":         args.resume,
-        "use_wandb":      args.use_wandb,
+        "resume":         False,
+        "use_wandb":      False,
         "wandb_project":  "sign2text",
+        "log_interval":   100,
     }
 
     # Sovrascrittura da file JSON
