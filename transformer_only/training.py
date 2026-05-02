@@ -131,6 +131,9 @@ def validate(
     model.eval()
     total_loss = 0.0
     total_tok  = 0
+    total_unk  = 0
+    total_hyp_tok = 0
+    total_hyp_unk = 0
     all_hyps   = []
     all_refs   = []
 
@@ -153,8 +156,10 @@ def validate(
             )
 
         n_tok       = (tgt_out != model.pad_id).sum().item()
+        n_unk       = (tgt_out == tokenizer.unk_id).sum().item()
         total_loss += loss.item() * n_tok
         total_tok  += n_tok
+        total_unk  += n_unk
 
         # Greedy per BLEU
         hyps = model.greedy_decode(
@@ -164,6 +169,8 @@ def validate(
             max_len=max_decode_len,
             src_key_padding_mask=src_mask,
         )
+        total_hyp_tok += sum(len(h) for h in hyps)
+        total_hyp_unk += sum(sum(1 for t in h if t == tokenizer.unk_id) for h in hyps)
         refs = batch["sentences"]
         all_hyps.extend([tokenizer.decode(h) for h in hyps])
         all_refs.extend(refs)
@@ -171,7 +178,19 @@ def validate(
     avg_loss = total_loss / max(1, total_tok)
     ppl      = math.exp(min(avg_loss, 20))
     bleu     = compute_bleu(all_hyps, all_refs)
-    return {"loss": avg_loss, "ppl": ppl, "bleu": bleu}
+    tgt_unk_rate = total_unk / max(1, total_tok)
+    hyp_unk_rate = total_hyp_unk / max(1, total_hyp_tok)
+    avg_ref_len = total_tok / max(1, len(all_refs))
+    avg_hyp_len = total_hyp_tok / max(1, len(all_hyps))
+    return {
+        "loss": avg_loss,
+        "ppl": ppl,
+        "bleu": bleu,
+        "tgt_unk_rate": tgt_unk_rate,
+        "hyp_unk_rate": hyp_unk_rate,
+        "avg_ref_len": avg_ref_len,
+        "avg_hyp_len": avg_hyp_len,
+    }
 
 
 # ──────────────────────────────────────────────
@@ -240,7 +259,15 @@ def main(cfg: dict):
         num_workers   = cfg["num_workers"],
         max_src_len   = cfg["max_src_len"],
         max_tgt_len   = cfg["max_tgt_len"],
+        pose_weight   = cfg.get("pose_weight", 1.0),
+        hand_weight   = cfg.get("hand_weight", 1.6),
+        face_weight   = cfg.get("face_weight", 0.7),
         test_csv      = cfg.get("test_csv"),
+        train_subset_fraction = cfg.get("train_subset_fraction"),
+        val_subset_fraction   = cfg.get("val_subset_fraction"),
+        train_max_samples      = cfg.get("train_max_samples"),
+        val_max_samples        = cfg.get("val_max_samples"),
+        subset_seed           = cfg.get("subset_seed", 42),
     )
 
     steps_per_epoch = len(loaders["train"])
@@ -310,20 +337,25 @@ def main(cfg: dict):
             f"lr={optimizer.param_groups[0]['lr']:.2e}"
         )
 
-        val_stats = validate(
-            model, loaders["val"], device, use_amp, tokenizer,
-            max_decode_len=cfg["max_tgt_len"],
-        )
-        print(
-            f"  VAL    loss={val_stats['loss']:.4f}  "
-            f"ppl={val_stats['ppl']:.2f}  "
-            f"BLEU={val_stats['bleu']:.2f}"
-        )
+        run_val = ((epoch + 1) % cfg["val_interval"] == 0) or (epoch + 1 == cfg["epochs"])
+        val_stats = None
+        if run_val:
+            val_stats = validate(
+                model, loaders["val"], device, use_amp, tokenizer,
+                max_decode_len=cfg["max_tgt_len"],
+            )
+            print(
+                f"  VAL    loss={val_stats['loss']:.4f}  "
+                f"ppl={val_stats['ppl']:.2f}  "
+                f"BLEU={val_stats['bleu']:.2f}"
+            )
+        else:
+            print(f"  VAL    skipped (interval={cfg['val_interval']})")
 
         # Checkpoint
         save_checkpoint(resume_path, epoch, model, optimizer, scheduler, scaler, best_bleu, cfg)
 
-        if val_stats["bleu"] > best_bleu:
+        if val_stats and val_stats["bleu"] > best_bleu:
             best_bleu = val_stats["bleu"]
             best_path = out_dir / "best.pt"
             save_checkpoint(best_path, epoch, model, optimizer, scheduler, scaler, best_bleu, cfg)
@@ -331,15 +363,19 @@ def main(cfg: dict):
 
         if use_wandb:
             import wandb
-            wandb.log({
+            log_payload = {
                 "epoch": epoch + 1,
                 "train/loss": train_stats["loss"],
                 "train/ppl":  train_stats["ppl"],
-                "val/loss":   val_stats["loss"],
-                "val/ppl":    val_stats["ppl"],
-                "val/bleu":   val_stats["bleu"],
                 "lr":         optimizer.param_groups[0]["lr"],
-            })
+            }
+            if val_stats:
+                log_payload.update({
+                    "val/loss":   val_stats["loss"],
+                    "val/ppl":    val_stats["ppl"],
+                    "val/bleu":   val_stats["bleu"],
+                })
+            wandb.log(log_payload)
 
     print(f"\nTraining completato. Best BLEU: {best_bleu:.2f}")
     if use_wandb:
@@ -385,6 +421,9 @@ if __name__ == "__main__":
         "label_smoothing":0.1,
         "max_src_len":    512,
         "max_tgt_len":    128,
+        "pose_weight":   1.0,
+        "hand_weight":   1.3,
+        "face_weight":   0.7,
         # training
         "epochs":         100,
         "batch_size":     32,
@@ -397,6 +436,12 @@ if __name__ == "__main__":
         "use_wandb":      False,
         "wandb_project":  "sign2text",
         "log_interval":   100,
+        "val_interval":   1,
+        "train_subset_fraction": None,
+        "val_subset_fraction":   None,
+        "train_max_samples": None,
+        "val_max_samples":   None,
+        "subset_seed":       42,
     }
 
     # Sovrascrittura da file JSON

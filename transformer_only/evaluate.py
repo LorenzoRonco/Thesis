@@ -7,6 +7,7 @@ Defaults:
 """
 
 import argparse
+import gc
 import json
 from pathlib import Path
 
@@ -38,6 +39,108 @@ def compute_bleu(predictions: list[str], references: list[str]) -> float:
 
 def decode_batch(token_ids: list[list[int]], tokenizer: SentenceTokenizer) -> list[str]:
     return [tokenizer.decode(ids) for ids in token_ids]
+
+
+def _edit_distance(ref_words: list[str], hyp_words: list[str]) -> int:
+    if not ref_words:
+        return len(hyp_words)
+    if not hyp_words:
+        return len(ref_words)
+
+    prev = list(range(len(hyp_words) + 1))
+    for i, r in enumerate(ref_words, start=1):
+        curr = [i] + [0] * len(hyp_words)
+        for j, h in enumerate(hyp_words, start=1):
+            if r == h:
+                curr[j] = prev[j - 1]
+            else:
+                curr[j] = 1 + min(prev[j], curr[j - 1], prev[j - 1])
+        prev = curr
+    return prev[-1]
+
+
+def compute_wer(predictions: list[str], references: list[str]) -> float:
+    total_edits = 0
+    total_words = 0
+    for hyp, ref in zip(predictions, references):
+        ref_words = ref.strip().split()
+        hyp_words = hyp.strip().split()
+        total_edits += _edit_distance(ref_words, hyp_words)
+        total_words += len(ref_words)
+    return total_edits / max(1, total_words)
+
+
+def _compute_output_diversity(predictions: list[str]) -> dict:
+    """Analizza la diversità degli output per rilevare collasso su frasi ripetute."""
+    from collections import Counter
+    import math
+    
+    all_words = []
+    for pred in predictions:
+        words = pred.strip().split()
+        all_words.extend(words)
+    
+    if not all_words:
+        return {
+            "unique_words": 0,
+            "total_words": 0,
+            "vocab_coverage": 0,
+            "entropy": 0,
+            "top_10_word_ratio": 0,
+            "most_common_word": ("N/A", 0),
+        }
+    
+    word_counts = Counter(all_words)
+    unique_words = len(word_counts)
+    total_words = len(all_words)
+    
+    # Entropia di Shannon
+    probs = [c / total_words for c in word_counts.values()]
+    entropy = -sum(p * math.log(p) for p in probs if p > 0)
+    
+    top_10_freq = sum(count for word, count in word_counts.most_common(10))
+    top_10_ratio = top_10_freq / total_words
+    
+    return {
+        "unique_words": unique_words,
+        "total_words": total_words,
+        "vocab_coverage": unique_words / max(1, total_words),
+        "entropy": entropy,
+        "top_10_word_ratio": top_10_ratio,
+        "most_common_word": word_counts.most_common(1)[0] if word_counts else ("N/A", 0),
+    }
+
+
+def _compute_output_similarities(predictions: list[str]) -> dict:
+    """Rileva se il modello produce output troppo simili (segno di memorizzazione)."""
+    from difflib import SequenceMatcher
+    import random
+    
+    if len(predictions) < 2:
+        return {
+            "avg_similarity": 0,
+            "max_similarity": 0,
+            "identical_or_near_count": 0,
+        }
+    
+    similarities = []
+    identical = 0
+    
+    # Campiona coppie casuali (per velocità)
+    sample_size = min(100, len(predictions) // 2)
+    
+    for _ in range(sample_size):
+        i, j = random.sample(range(len(predictions)), 2)
+        sim = SequenceMatcher(None, predictions[i], predictions[j]).ratio()
+        similarities.append(sim)
+        if sim > 0.95:
+            identical += 1
+    
+    return {
+        "avg_similarity": sum(similarities) / max(1, len(similarities)),
+        "max_similarity": max(similarities) if similarities else 0,
+        "identical_or_near_count": identical,
+    }
 
 
 def _load_checkpoint(checkpoint_path: Path, device: torch.device) -> dict:
@@ -80,6 +183,17 @@ def _resolve_model_cfg(cli_cfg: dict, ckpt_cfg: dict) -> dict:
     }
 
 
+def _resolve_data_weights(cli_cfg: dict, ckpt_cfg: dict) -> dict:
+    def _pick(key: str, default):
+        return cli_cfg.get(key) if cli_cfg.get(key) is not None else ckpt_cfg.get(key, default)
+
+    return {
+        "pose_weight": _pick("pose_weight", 1.0),
+        "hand_weight": _pick("hand_weight", 1.3),
+        "face_weight": _pick("face_weight", 0.7),
+    }
+
+
 def evaluate(cfg: dict) -> dict:
     device = torch.device(cfg["device"] if torch.cuda.is_available() else "cpu")
     use_amp = cfg.get("use_amp", True) and device.type == "cuda"
@@ -93,6 +207,7 @@ def evaluate(cfg: dict) -> dict:
 
     tokenizer = _load_tokenizer(cfg)
     model_cfg = _resolve_model_cfg(cfg, ckpt_cfg)
+    data_weights = _resolve_data_weights(cfg, ckpt_cfg)
 
     dataset = How2SignDataset(
         csv_path=cfg["val_csv"],
@@ -100,6 +215,9 @@ def evaluate(cfg: dict) -> dict:
         tokenizer=tokenizer,
         max_src_len=model_cfg["max_src_len"],
         max_tgt_len=model_cfg["max_tgt_len"],
+        pose_weight=data_weights["pose_weight"],
+        hand_weight=data_weights["hand_weight"],
+        face_weight=data_weights["face_weight"],
     )
     loader = DataLoader(
         dataset,
@@ -140,6 +258,9 @@ def evaluate(cfg: dict) -> dict:
 
     total_loss = 0.0
     total_tok = 0
+    total_unk = 0
+    total_hyp_tok = 0
+    total_hyp_unk = 0
     all_hyps: list[str] = []
     all_refs: list[str] = []
 
@@ -160,8 +281,10 @@ def evaluate(cfg: dict) -> dict:
             )
 
         n_tok = (tgt_out != model.pad_id).sum().item()
+        n_unk = (tgt_out == tokenizer.unk_id).sum().item()
         total_loss += loss.item() * n_tok
         total_tok += n_tok
+        total_unk += n_unk
 
         hyps = model.greedy_decode(
             src=src,
@@ -170,39 +293,71 @@ def evaluate(cfg: dict) -> dict:
             max_len=cfg["max_decode_len"],
             src_key_padding_mask=src_mask,
         )
+        total_hyp_tok += sum(len(h) for h in hyps)
+        total_hyp_unk += sum(sum(1 for t in h if t == tokenizer.unk_id) for h in hyps)
         all_hyps.extend(decode_batch(hyps, tokenizer))
         all_refs.extend(batch["sentences"])
 
     avg_loss = total_loss / max(1, total_tok)
     ppl = torch.exp(torch.tensor(min(avg_loss, 20.0))).item()
     bleu = compute_bleu(all_hyps, all_refs)
+    wer = compute_wer(all_hyps, all_refs)
+
+    tgt_unk_rate = total_unk / max(1, total_tok)
+    hyp_unk_rate = total_hyp_unk / max(1, total_hyp_tok)
+    avg_ref_len = total_tok / max(1, len(all_refs))
+    avg_hyp_len = total_hyp_tok / max(1, len(all_hyps))
+    
+    # Diagnosi: il modello sta imparando token-level o intere frasi?
+    diversity_stats = _compute_output_diversity(all_hyps)
+    similarity_stats = _compute_output_similarities(all_hyps)
 
     return {
         "loss": avg_loss,
         "ppl": ppl,
         "bleu": bleu,
+        "wer": wer,
         "num_samples": len(dataset),
+        "hyps": all_hyps,
+        "refs": all_refs,
+        "tgt_unk_rate": tgt_unk_rate,
+        "hyp_unk_rate": hyp_unk_rate,
+        "avg_ref_len": avg_ref_len,
+        "avg_hyp_len": avg_hyp_len,
+        "diversity": diversity_stats,
+        "similarity": similarity_stats,
     }
 
 
+def _cleanup(device: torch.device):
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
 def main():
+    batch_size_default = 8
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, default="outputs/run1/best.pt")
     parser.add_argument("--output_dir", type=str, default="outputs/run1")
     parser.add_argument("--tokenizer_path", type=str, default=None)
     parser.add_argument("--train_csv", type=str, default=None)
     parser.add_argument(
-        "--val_csv", type=str, default="dataset/how2sign_realigned_validation.csv"
+        "--val_csv", type=str, default="dataset/how2sign_realigned_val.csv"
     )
     parser.add_argument(
         "--landmarks_dir", type=str, default="dataset/landmarks_validation_normalized"
     )
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=batch_size_default)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_decode_len", type=int, default=128)
+    parser.add_argument("--num_examples", type=int, default=5)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--use_amp", action="store_true")
     parser.add_argument("--config", type=str, default=None)
+    parser.add_argument("--pose_weight", type=float, default=None)
+    parser.add_argument("--hand_weight", type=float, default=None)
+    parser.add_argument("--face_weight", type=float, default=None)
 
     args = parser.parse_args()
     cfg = vars(args)
@@ -211,12 +366,46 @@ def main():
         with open(args.config, "r", encoding="utf-8") as f:
             cfg.update(json.load(f))
 
-    results = evaluate(cfg)
-    print("\nValidation results")
-    print(f"  samples: {results['num_samples']}")
-    print(f"  loss:    {results['loss']:.4f}")
-    print(f"  ppl:     {results['ppl']:.2f}")
-    print(f"  BLEU:    {results['bleu']:.2f}")
+    try:
+        results = evaluate(cfg)
+        print("\nValidation results")
+        print(f"  samples: {results['num_samples']}")
+        print(f"  loss:    {results['loss']:.4f}")
+        print(f"  ppl:     {results['ppl']:.2f}")
+        print(f"  BLEU:    {results['bleu']:.2f}")
+        print(f"  WER:     {results['wer']:.2%}")
+        print(f"  tgt UNK: {results['tgt_unk_rate']:.2%}")
+        print(f"  hyp UNK: {results['hyp_unk_rate']:.2%}")
+        print(f"  avg ref len: {results['avg_ref_len']:.1f}")
+        print(f"  avg hyp len: {results['avg_hyp_len']:.1f}")
+        
+        # Diagnosi diversità output
+        div = results['diversity']
+        sim = results['similarity']
+        print(f"\n  Output Diversity (token-level learning?)")
+        print(f"    unique words: {div['unique_words']} / {div['total_words']} ({div['vocab_coverage']:.1%})")
+        print(f"    entropy: {div['entropy']:.3f}")
+        print(f"    top-10 word ratio: {div['top_10_word_ratio']:.1%}")
+        print(f"    most common: '{div['most_common_word'][0]}' ({div['most_common_word'][1]}x)")
+        print(f"\n  Output Similarity (memorization check)")
+        print(f"    avg similarity: {sim['avg_similarity']:.3f}")
+        print(f"    identical/near-identical pairs (>0.95): {sim['identical_or_near_count']}")
+        if sim['avg_similarity'] > 0.8:
+            print(f"    ⚠️  ALTO: il modello genera output molto simili (possibile collasso)")
+        elif sim['avg_similarity'] > 0.6:
+            print(f"    ⚠️  MEDIO: output moderatamente simili")
+        else:
+            print(f"    ✓ BASSO: buona diversità")
+
+        num_examples = cfg.get("num_examples", 0) or 0
+        if num_examples > 0:
+            print("\nExamples (reference -> prediction)")
+            for i in range(min(num_examples, len(results["refs"]))):
+                print(f"[{i+1:02d}] REF:  {results['refs'][i]}")
+                print(f"     HYP:  {results['hyps'][i]}")
+    finally:
+        device = torch.device(cfg["device"] if torch.cuda.is_available() else "cpu")
+        _cleanup(device)
 
 
 if __name__ == "__main__":

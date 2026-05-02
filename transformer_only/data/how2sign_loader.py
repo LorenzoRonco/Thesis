@@ -34,6 +34,12 @@ N_LANDMARKS  = 527
 N_DIMS       = 4          # x, y, z, visibility/presence
 FEAT_DIM     = N_LANDMARKS * N_DIMS   # 2108
 
+# Landmark group sizes (MediaPipe Holistic ordering)
+POSE_LANDMARKS = 17
+LEFT_HAND_LANDMARKS = 21
+RIGHT_HAND_LANDMARKS = 21
+FACE_LANDMARKS = 468
+
 
 # ─────────────────────────────────────────────
 # Tokenizer minimale (character-level o word-level)
@@ -155,15 +161,45 @@ class How2SignDataset(Dataset):
         max_src_len: Optional[int] = 512,
         max_tgt_len: Optional[int] = 128,
         flatten_landmarks: bool = True,
+        pose_weight: float = 1.0,
+        hand_weight: float = 1.0,
+        face_weight: float = 1.0,
+        subset_fraction: Optional[float] = None,
+        max_samples: Optional[int] = None,
+        sample_seed: int = 42,
     ):
         self.landmarks_dir  = Path(landmarks_dir)
         self.tokenizer      = tokenizer
         self.max_src_len    = max_src_len
         self.max_tgt_len    = max_tgt_len
         self.flatten        = flatten_landmarks
+        self.pose_weight    = pose_weight
+        self.hand_weight    = hand_weight
+        self.face_weight    = face_weight
+        self.subset_fraction = subset_fraction
+        self.max_samples     = max_samples
+        self.sample_seed     = sample_seed
 
         self.samples: list[dict] = []
         self._load_csv(csv_path)
+        self._apply_subset()
+
+    def _apply_subset(self):
+        if not self.samples:
+            return
+        total = len(self.samples)
+        target = total
+
+        if self.subset_fraction is not None and self.subset_fraction < 1.0:
+            target = max(1, int(total * self.subset_fraction))
+
+        if self.max_samples is not None:
+            target = min(target, self.max_samples)
+
+        if target < total:
+            rng = random.Random(self.sample_seed)
+            self.samples = rng.sample(self.samples, k=target)
+            print(f"[How2SignDataset] Subset: {target}/{total} campioni")
 
     # ── caricamento CSV ───────────────────────
     def _load_csv(self, csv_path: str | Path):
@@ -215,6 +251,18 @@ class How2SignDataset(Dataset):
         # Tronca temporalmente
         if self.max_src_len and lm.shape[0] > self.max_src_len:
             lm = lm[: self.max_src_len]
+
+        # Pesi per gruppi di landmark (pose / hands / face)
+        pose_end = POSE_LANDMARKS
+        left_end = pose_end + LEFT_HAND_LANDMARKS
+        right_end = left_end + RIGHT_HAND_LANDMARKS
+        if self.pose_weight != 1.0:
+            lm[:, :pose_end, :] *= self.pose_weight
+        if self.hand_weight != 1.0:
+            lm[:, pose_end:left_end, :] *= self.hand_weight
+            lm[:, left_end:right_end, :] *= self.hand_weight
+        if self.face_weight != 1.0:
+            lm[:, right_end:, :] *= self.face_weight
 
 
         # Output shape sorgente
@@ -338,9 +386,17 @@ def build_dataloaders(
     num_workers:   int = 4,
     max_src_len:   int = 512,
     max_tgt_len:   int = 128,
+    pose_weight:   float = 1.0,
+    hand_weight:   float = 1.0,
+    face_weight:   float = 1.0,
     pin_memory:    bool = True,
     test_csv:      Optional[str | Path] = None,
     test_landmarks_dir: Optional[str | Path] = None,
+    train_subset_fraction: Optional[float] = None,
+    val_subset_fraction: Optional[float] = None,
+    train_max_samples: Optional[int] = None,
+    val_max_samples: Optional[int] = None,
+    subset_seed: int = 42,
 ) -> dict[str, DataLoader]:
     """
     Restituisce un dizionario {"train": ..., "val": ..., "test": ...}.
@@ -348,13 +404,19 @@ def build_dataloaders(
     from functools import partial
     _collate = partial(collate_fn, pad_id=tokenizer.pad_id)
 
-    def _make_loader(csv_path, shuffle, lm_dir):
+    def _make_loader(csv_path, shuffle, lm_dir, subset_fraction, max_samples):
         ds = How2SignDataset(
             csv_path=csv_path,
             landmarks_dir=lm_dir,
             tokenizer=tokenizer,
             max_src_len=max_src_len,
             max_tgt_len=max_tgt_len,
+            pose_weight=pose_weight,
+            hand_weight=hand_weight,
+            face_weight=face_weight,
+            subset_fraction=subset_fraction,
+            max_samples=max_samples,
+            sample_seed=subset_seed,
         )
         return DataLoader(
             ds,
@@ -367,14 +429,28 @@ def build_dataloaders(
         )
 
     loaders = {
-        "train": _make_loader(train_csv,  shuffle=True,  lm_dir=train_landmarks_dir),
-        "val":   _make_loader(val_csv,         shuffle=False, lm_dir=val_landmarks_dir),
+        "train": _make_loader(
+            train_csv,
+            shuffle=True,
+            lm_dir=train_landmarks_dir,
+            subset_fraction=train_subset_fraction,
+            max_samples=train_max_samples,
+        ),
+        "val":   _make_loader(
+            val_csv,
+            shuffle=False,
+            lm_dir=val_landmarks_dir,
+            subset_fraction=val_subset_fraction,
+            max_samples=val_max_samples,
+        ),
     }
     if test_csv:
         loaders["test"] = _make_loader(
             test_csv,
             shuffle=False,
             lm_dir=test_landmarks_dir or val_landmarks_dir,
+            subset_fraction=val_subset_fraction,
+            max_samples=val_max_samples,
         )
 
     return loaders

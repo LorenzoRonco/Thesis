@@ -268,10 +268,11 @@ class SignLanguageTransformer(nn.Module):
     ) -> Tensor:
         """Restituisce le rappresentazioni encoder: (B, T, d_model)"""
         src_emb = self.src_embed(src)             # (B, T, d_model)
-        return self.encoder(
+        memory = self.encoder(
             src_emb,
             src_key_padding_mask=src_key_padding_mask,
         )
+        return memory
 
     # ── Greedy decoding ───────────────────────
     @torch.no_grad()
