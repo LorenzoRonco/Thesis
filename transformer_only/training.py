@@ -27,21 +27,62 @@ from transformer_only.evaluate import compute_bleu, decode_batch          # defi
 
 
 # ──────────────────────────────────────────────
-# Scheduler: warm-up lineare + cosine decay
+# Scheduler: linear warmup followed by cosine annealing (SequentialLR wrapper)
 # ──────────────────────────────────────────────
-class WarmupCosineScheduler(torch.optim.lr_scheduler.LambdaLR):
-    def __init__(self, optimizer, warmup_steps: int, total_steps: int, min_lr_ratio: float = 0.05):
-        self.warmup = warmup_steps
-        self.total  = total_steps
-        self.min_r  = min_lr_ratio
-        super().__init__(optimizer, lr_lambda=self._lr_lambda)
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 
-    def _lr_lambda(self, step: int) -> float:
-        if step < self.warmup:
-            return step / max(1, self.warmup)
-        progress = (step - self.warmup) / max(1, self.total - self.warmup)
-        cosine   = 0.5 * (1 + math.cos(math.pi * progress))
-        return self.min_r + (1 - self.min_r) * cosine
+
+class WarmupCosineScheduler:
+    """
+    Wrapper that composes a Linear warmup followed by CosineAnnealingLR.
+
+    Exposes a compatible API: step(), state_dict(), load_state_dict().
+    """
+    def __init__(self, optimizer, warmup_steps: int, total_steps: int, min_lr_ratio: float = 0.05):
+        self.optimizer = optimizer
+        self.warmup = int(warmup_steps)
+        self.total = int(total_steps)
+        self.min_r = float(min_lr_ratio)
+
+        # Protect against degenerate schedules
+        main_steps = max(1, self.total - max(0, self.warmup))
+
+        # Cosine annealing from base_lr -> base_lr * min_lr_ratio
+        try:
+            base_lr = optimizer.param_groups[0]["lr"]
+            eta_min = base_lr * self.min_r
+        except Exception:
+            eta_min = 0.0
+
+        self.cosine_sched = CosineAnnealingLR(optimizer, T_max=main_steps, eta_min=eta_min)
+
+        # Warmup is optional; LinearLR requires start_factor > 0
+        self._has_warmup = self.warmup > 0
+        if self._has_warmup:
+            warmup_start = 1e-8
+            self.warmup_sched = LinearLR(
+                optimizer,
+                start_factor=warmup_start,
+                end_factor=1.0,
+                total_iters=self.warmup,
+            )
+            self.scheduler = SequentialLR(
+                optimizer,
+                schedulers=[self.warmup_sched, self.cosine_sched],
+                milestones=[self.warmup],
+            )
+        else:
+            self.warmup_sched = None
+            self.scheduler = self.cosine_sched
+
+    def step(self):
+        return self.scheduler.step()
+
+    def state_dict(self):
+        return self.scheduler.state_dict()
+
+    def load_state_dict(self, state):
+        return self.scheduler.load_state_dict(state)
 
 
 # ──────────────────────────────────────────────
@@ -74,6 +115,21 @@ def train_epoch(
         tgt_out  = batch["tgt_output"].to(device, non_blocking=True)
         src_mask = batch["src_key_padding_mask"].to(device, non_blocking=True)
         tin_mask = batch["tgt_in_key_padding_mask"].to(device, non_blocking=True)
+
+        if not hasattr(train_epoch, "_logged_padding"):
+            src_lens = batch.get("src_lens")
+            tgt_lens = batch.get("tgt_lens")
+            if src_lens is not None and tgt_lens is not None:
+                T_max = int(src_lens.max().item()) if src_lens.numel() else 1
+                L_max = int(tgt_lens.max().item()) if tgt_lens.numel() else 1
+                mean_src_len = src_lens.float().mean().item() if src_lens.numel() else 0.0
+                mean_tgt_len = tgt_lens.float().mean().item() if tgt_lens.numel() else 0.0
+                src_padding_ratio = (T_max - mean_src_len) / T_max if T_max > 0 else 0.0
+                tgt_padding_ratio = (L_max - mean_tgt_len) / L_max if L_max > 0 else 0.0
+                print("[train_epoch] Padding statistics (first batch):")
+                print(f"  Source (landmarks): T_max={T_max}, mean_len={mean_src_len:.1f}, padding_ratio={src_padding_ratio:.1%}")
+                print(f"  Target (tokens):    L_max={L_max}, mean_len={mean_tgt_len:.1f}, padding_ratio={tgt_padding_ratio:.1%}")
+            train_epoch._logged_padding = True
 
         optimizer.zero_grad(set_to_none=True)
 

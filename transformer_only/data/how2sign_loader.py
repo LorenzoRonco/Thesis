@@ -23,7 +23,7 @@ from typing import Optional
 import numpy as np
 import torch
 from torch import Tensor
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 from torch.nn.utils.rnn import pad_sequence
 
 
@@ -167,6 +167,12 @@ class How2SignDataset(Dataset):
         subset_fraction: Optional[float] = None,
         max_samples: Optional[int] = None,
         sample_seed: int = 42,
+        normalize_stats: Optional[dict] = None,
+        use_hand_relative_norm: bool = True,
+        augment: bool = False,
+        thumb_dropout_prob: float = 0.0,
+        hand_landmark_dropout_prob: float = 0.0,
+        hand_noise_std: float = 0.0,
     ):
         self.landmarks_dir  = Path(landmarks_dir)
         self.tokenizer      = tokenizer
@@ -179,10 +185,84 @@ class How2SignDataset(Dataset):
         self.subset_fraction = subset_fraction
         self.max_samples     = max_samples
         self.sample_seed     = sample_seed
+        self.use_hand_relative_norm = use_hand_relative_norm
+        self.augment = augment
+        self.thumb_dropout_prob = thumb_dropout_prob
+        self.hand_landmark_dropout_prob = hand_landmark_dropout_prob
+        self.hand_noise_std = hand_noise_std
+        # Normalization stats (optional): dict with 'mean' and 'std' numpy arrays
+        self.normalize_stats = normalize_stats
+        if normalize_stats is not None:
+            mean = normalize_stats.get("mean")
+            std = normalize_stats.get("std")
+            if mean is None or std is None:
+                raise ValueError("normalize_stats must contain 'mean' and 'std'")
+            # store as numpy arrays (will convert to tensor per-sample)
+            self._norm_mean = np.asarray(mean, dtype=np.float32)
+            self._norm_std = np.asarray(std, dtype=np.float32)
+        else:
+            self._norm_mean = None
+            self._norm_std = None
 
         self.samples: list[dict] = []
         self._load_csv(csv_path)
         self._apply_subset()
+
+    def _apply_hand_relative_normalization(self, lm: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize hand landmarks relative to their wrist for each frame.
+        Keeps confidence channel unchanged.
+        lm shape: (T, 527, 4)
+        """
+        # Global indices in this project layout:
+        # pose [0:17), left hand [17:38), right hand [38:59), face [59:527)
+        left_start = POSE_LANDMARKS
+        right_start = POSE_LANDMARKS + LEFT_HAND_LANDMARKS
+
+        # Wrist is local index 0 in MediaPipe hand landmarks.
+        left_wrist = lm[:, left_start:left_start + 1, :3]    # (T, 1, 3)
+        right_wrist = lm[:, right_start:right_start + 1, :3] # (T, 1, 3)
+
+        lm[:, left_start:left_start + LEFT_HAND_LANDMARKS, :3] -= left_wrist
+        lm[:, right_start:right_start + RIGHT_HAND_LANDMARKS, :3] -= right_wrist
+        return lm
+
+    def _apply_hand_augmentation(self, lm: torch.Tensor) -> torch.Tensor:
+        """
+        Data augmentation for hands: thumb dropout, random hand-point dropout, gaussian noise.
+        Applied only during training dataset.
+        lm shape: (T, 527, 4)
+        """
+        if not self.augment:
+            return lm
+
+        left_start = POSE_LANDMARKS
+        right_start = POSE_LANDMARKS + LEFT_HAND_LANDMARKS
+        hand_ranges = [
+            (left_start, left_start + LEFT_HAND_LANDMARKS),
+            (right_start, right_start + RIGHT_HAND_LANDMARKS),
+        ]
+
+        # Thumb local indices in MediaPipe Hands: 1..4
+        thumb_local = [1, 2, 3, 4]
+
+        for hs, he in hand_ranges:
+            if self.thumb_dropout_prob > 0.0 and random.random() < self.thumb_dropout_prob:
+                for t_idx in thumb_local:
+                    gi = hs + t_idx
+                    lm[:, gi, :] = 0.0
+
+            if self.hand_landmark_dropout_prob > 0.0:
+                keep_mask = torch.rand((he - hs,), device=lm.device) > self.hand_landmark_dropout_prob
+                for i, keep in enumerate(keep_mask.tolist()):
+                    if not keep:
+                        lm[:, hs + i, :] = 0.0
+
+            if self.hand_noise_std > 0.0:
+                noise = torch.randn_like(lm[:, hs:he, :3]) * self.hand_noise_std
+                lm[:, hs:he, :3] += noise
+
+        return lm
 
     def _apply_subset(self):
         if not self.samples:
@@ -252,7 +332,23 @@ class How2SignDataset(Dataset):
         if self.max_src_len and lm.shape[0] > self.max_src_len:
             lm = lm[: self.max_src_len]
 
-        # Pesi per gruppi di landmark (pose / hands / face)
+        # Hand-centric normalization (relative to wrist) to reduce absolute-position dominance.
+        if self.use_hand_relative_norm:
+            lm = self._apply_hand_relative_normalization(lm)
+
+        # Standardizzazione per-feature (se fornita)
+        if self._norm_mean is not None and self._norm_std is not None:
+            # _norm_mean/std have shape (FEAT_DIM,) for flattened representation
+            # Apply per-frame standardization
+            T = lm.shape[0]
+            flat = lm.view(T, FEAT_DIM).numpy()
+            flat = (flat - self._norm_mean) / (self._norm_std + 1e-6)
+            lm = torch.from_numpy(flat).float().view(T, N_LANDMARKS, N_DIMS)
+
+        # Training-only hand augmentation (finger dropout + noise)
+        lm = self._apply_hand_augmentation(lm)
+
+        # Pesi per gruppi di landmark (pose / hands / face) -- applicati DOPO standardizzazione
         pose_end = POSE_LANDMARKS
         left_end = pose_end + LEFT_HAND_LANDMARKS
         right_end = left_end + RIGHT_HAND_LANDMARKS
@@ -263,7 +359,6 @@ class How2SignDataset(Dataset):
             lm[:, left_end:right_end, :] *= self.hand_weight
         if self.face_weight != 1.0:
             lm[:, right_end:, :] *= self.face_weight
-
 
         # Output shape sorgente
         if self.flatten:
@@ -283,6 +378,8 @@ class How2SignDataset(Dataset):
             "tgt":            tgt_ids,      # (L,)
             "sentence_name":  sample["sentence_name"],
             "sentence":       sample["sentence"],
+            "sentence_id":    sample["sentence_id"],
+            "npy_path":       str(sample["npy_path"]),
         }
 
 
@@ -304,6 +401,8 @@ def collate_fn(batch: list[dict], pad_id: int = 0) -> dict:
     tgts      = [item["tgt"] for item in batch]
     sentences = [item["sentence"] for item in batch]
     names     = [item["sentence_name"] for item in batch]
+    sent_ids  = [item.get("sentence_id", "") for item in batch]
+    npy_paths = [item.get("npy_path", "") for item in batch]
 
     src_lens = [s.shape[0] for s in srcs]
     tgt_lens = [t.shape[0] for t in tgts]
@@ -344,9 +443,62 @@ def collate_fn(batch: list[dict], pad_id: int = 0) -> dict:
         "tgt_out_key_padding_mask": tgt_out_mask,
         "sentences":  sentences,
         "names":      names,
+        "sentence_ids": sent_ids,
+        "npy_paths":  npy_paths,
         "src_lens":   torch.tensor(src_lens),
         "tgt_lens":   torch.tensor(tgt_lens),
     }
+
+
+# ─────────────────────────────────────────────
+# Bucketing sampler (riduce padding)
+# ─────────────────────────────────────────────
+class BucketingBatchSampler(Sampler[list[int]]):
+    def __init__(
+        self,
+        lengths: list[int],
+        batch_size: int,
+        bucket_size: int = 200,
+        shuffle: bool = True,
+        drop_last: bool = False,
+        seed: int = 42,
+    ):
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.bucket_size = max(batch_size, bucket_size)
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self._epoch = 0
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self._epoch)
+        indices = list(range(len(self.lengths)))
+        indices.sort(key=lambda i: self.lengths[i])
+
+        buckets = [indices[i : i + self.bucket_size] for i in range(0, len(indices), self.bucket_size)]
+        if self.shuffle:
+            for bucket in buckets:
+                rng.shuffle(bucket)
+            rng.shuffle(buckets)
+
+        batch: list[int] = []
+        for bucket in buckets:
+            for idx in bucket:
+                batch.append(idx)
+                if len(batch) == self.batch_size:
+                    yield batch
+                    batch = []
+
+        if batch and not self.drop_last:
+            yield batch
+
+        self._epoch += 1
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return len(self.lengths) // self.batch_size
+        return (len(self.lengths) + self.batch_size - 1) // self.batch_size
 
 
 # ─────────────────────────────────────────────
@@ -397,6 +549,13 @@ def build_dataloaders(
     train_max_samples: Optional[int] = None,
     val_max_samples: Optional[int] = None,
     subset_seed: int = 42,
+    use_bucketing: bool = False,
+    bucket_size: int = 200,
+    drop_last: bool = False,
+    use_hand_relative_norm: bool = True,
+    thumb_dropout_prob: float = 0.0,
+    hand_landmark_dropout_prob: float = 0.0,
+    hand_noise_std: float = 0.0,
 ) -> dict[str, DataLoader]:
     """
     Restituisce un dizionario {"train": ..., "val": ..., "test": ...}.
@@ -404,7 +563,52 @@ def build_dataloaders(
     from functools import partial
     _collate = partial(collate_fn, pad_id=tokenizer.pad_id)
 
-    def _make_loader(csv_path, shuffle, lm_dir, subset_fraction, max_samples):
+    def _compute_src_lengths(ds: How2SignDataset) -> list[int]:
+        lengths: list[int] = []
+        for sample in ds.samples:
+            npy_path = sample["npy_path"]
+            try:
+                arr = np.load(npy_path, mmap_mode="r")
+                seq_len = int(arr.shape[0])
+            except Exception:
+                seq_len = 0
+            if max_src_len:
+                seq_len = min(seq_len, max_src_len)
+            lengths.append(seq_len)
+        return lengths
+
+    def _compute_landmark_stats(samples_list, lm_dir):
+        """
+        Compute per-feature mean/std across the dataset (flattened feature dim).
+        Returns numpy arrays of shape (FEAT_DIM,)
+        """
+        ssum = None
+        ssq = None
+        count = 0
+        for sample in samples_list:
+            npy_path = Path(sample["npy_path"]) if isinstance(sample, dict) else Path(sample)
+            try:
+                arr = np.load(npy_path, mmap_mode="r")
+                if arr.ndim == 3:
+                    arr = arr.reshape(arr.shape[0], -1)
+                data = arr
+                if ssum is None:
+                    ssum = data.sum(axis=0, dtype=float)
+                    ssq = (data ** 2).sum(axis=0, dtype=float)
+                else:
+                    ssum += data.sum(axis=0, dtype=float)
+                    ssq += (data ** 2).sum(axis=0, dtype=float)
+                count += data.shape[0]
+            except Exception:
+                continue
+        if count == 0:
+            raise RuntimeError("Unable to compute landmark stats: no frames found")
+        mean = ssum / count
+        var = (ssq / count) - (mean ** 2)
+        std = np.sqrt(np.maximum(var, 1e-12))
+        return mean.astype(np.float32), std.astype(np.float32)
+
+    def _make_loader(csv_path, shuffle, lm_dir, subset_fraction, max_samples, normalize_stats=None):
         ds = How2SignDataset(
             csv_path=csv_path,
             landmarks_dir=lm_dir,
@@ -414,10 +618,35 @@ def build_dataloaders(
             pose_weight=pose_weight,
             hand_weight=hand_weight,
             face_weight=face_weight,
+            normalize_stats=normalize_stats,
+            use_hand_relative_norm=use_hand_relative_norm,
+            augment=shuffle,
+            thumb_dropout_prob=thumb_dropout_prob,
+            hand_landmark_dropout_prob=hand_landmark_dropout_prob,
+            hand_noise_std=hand_noise_std,
             subset_fraction=subset_fraction,
             max_samples=max_samples,
             sample_seed=subset_seed,
         )
+        if use_bucketing and shuffle:
+            lengths = _compute_src_lengths(ds)
+            batch_sampler = BucketingBatchSampler(
+                lengths=lengths,
+                batch_size=batch_size,
+                bucket_size=bucket_size,
+                shuffle=True,
+                drop_last=drop_last,
+                seed=subset_seed,
+            )
+            return DataLoader(
+                ds,
+                batch_sampler=batch_sampler,
+                num_workers=num_workers,
+                collate_fn=_collate,
+                pin_memory=pin_memory,
+                persistent_workers=(num_workers > 0),
+            )
+
         return DataLoader(
             ds,
             batch_size=batch_size,
@@ -428,6 +657,26 @@ def build_dataloaders(
             persistent_workers=(num_workers > 0),
         )
 
+    # Compute normalization stats from the training set and pass to datasets
+    normalize_stats = None
+    try:
+        train_samples = []
+        with open(train_csv, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            for row in reader:
+                sentence_name = row["SENTENCE_NAME"].strip()
+                sentence_id = row["SENTENCE_ID"].strip()
+                npy_path = Path(train_landmarks_dir) / f"{sentence_id}_{sentence_name}_landmarks.npy"
+                if npy_path.exists():
+                    train_samples.append({"npy_path": str(npy_path)})
+        if len(train_samples) > 0:
+            print(f"[build_dataloaders] Computing landmark normalization stats from {len(train_samples)} files...")
+            mean, std = _compute_landmark_stats(train_samples, train_landmarks_dir)
+            normalize_stats = {"mean": mean, "std": std}
+            print("[build_dataloaders] Landmark stats computed")
+    except Exception as e:
+        print(f"[build_dataloaders] Warning: could not compute normalize stats: {e}")
+
     loaders = {
         "train": _make_loader(
             train_csv,
@@ -435,6 +684,7 @@ def build_dataloaders(
             lm_dir=train_landmarks_dir,
             subset_fraction=train_subset_fraction,
             max_samples=train_max_samples,
+            normalize_stats=normalize_stats,
         ),
         "val":   _make_loader(
             val_csv,
@@ -442,6 +692,7 @@ def build_dataloaders(
             lm_dir=val_landmarks_dir,
             subset_fraction=val_subset_fraction,
             max_samples=val_max_samples,
+            normalize_stats=normalize_stats,
         ),
     }
     if test_csv:

@@ -45,6 +45,10 @@ class SinusoidalPositionalEncoding(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         """x: (B, T, D)"""
+        if x.size(1) > self.pe.size(1):
+            raise ValueError(
+                f"Sequence length {x.size(1)} exceeds max positional length {self.pe.size(1)}"
+            )
         x = x + self.pe[:, : x.size(1)]
         return self.dropout(x)
 
@@ -85,6 +89,12 @@ class LandmarkEmbedding(nn.Module):
         """src: (B, T, feat_dim) → (B, T, d_model)"""
         x = self.proj(src)
         x = self.norm(x)
+        if getattr(self, "debug_positional_encoding", False) and not getattr(self, "_logged_pe_once", False):
+            pe_slice = self.pos_enc.pe[:, : x.size(1)]
+            pe_delta = (pe_slice[:, 1] - pe_slice[:, 0]).abs().mean().item() if x.size(1) > 1 else 0.0
+            pe_std = pe_slice.std().item()
+            print(f"[PosEnc Debug] src_len={x.size(1)} pe_std={pe_std:.6f} pe_delta01={pe_delta:.6f}")
+            self._logged_pe_once = True
         return self.pos_enc(x)
 
 
@@ -145,6 +155,7 @@ class SignLanguageTransformer(nn.Module):
 
         self.d_model   = d_model
         self.pad_id    = pad_id
+        self.debug_positional_encoding = False
 
         # ── Embedding ─────────────────────────
         self.src_embed = LandmarkEmbedding(
@@ -153,6 +164,7 @@ class SignLanguageTransformer(nn.Module):
             max_len=max_src_len,
             dropout=dropout,
         )
+        self.src_embed.debug_positional_encoding = self.debug_positional_encoding
         self.tgt_embed = TokenEmbedding(
             vocab_size=vocab_size,
             d_model=d_model,
@@ -205,10 +217,24 @@ class SignLanguageTransformer(nn.Module):
 
     def _init_weights(self):
         for name, p in self.named_parameters():
+            # Token embedding: initialize with normal std = d_model^-0.5 (common practice)
+            if "tgt_embed.embedding.weight" in name:
+                nn.init.normal_(p, mean=0.0, std=self.d_model ** -0.5)
+                continue
+            # Linear and multi-dim weights
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
-            elif "bias" in name:
+                continue
+            # Biases
+            if "bias" in name:
                 nn.init.zeros_(p)
+                continue
+            # LayerNorm / 1-d params: keep defaults but ensure sensible init
+            if "norm" in name or "ln" in name or p.dim() == 1:
+                try:
+                    nn.init.ones_(p)
+                except Exception:
+                    pass
 
     # ── Causal mask ───────────────────────────
     @staticmethod
@@ -267,11 +293,29 @@ class SignLanguageTransformer(nn.Module):
         src_key_padding_mask: Tensor | None = None,
     ) -> Tensor:
         """Restituisce le rappresentazioni encoder: (B, T, d_model)"""
+        self.src_embed.debug_positional_encoding = getattr(self, "debug_positional_encoding", False)
         src_emb = self.src_embed(src)             # (B, T, d_model)
+
+        # Optional diagnostic printing: show stats of raw src, src_emb and memory once
+        if getattr(self, "debug_log_stats", False) and not getattr(self, "_logged_stats_once", False):
+            try:
+                print("[Model Debug] src stats: mean={:.6f}, std={:.6f}".format(src.mean().item(), src.std().item()))
+                print("[Model Debug] src_emb stats: mean={:.6f}, std={:.6f}".format(src_emb.mean().item(), src_emb.std().item()))
+            except Exception:
+                pass
+
         memory = self.encoder(
             src_emb,
             src_key_padding_mask=src_key_padding_mask,
         )
+
+        if getattr(self, "debug_log_stats", False) and not getattr(self, "_logged_stats_once", False):
+            try:
+                print("[Model Debug] memory stats: mean={:.6f}, std={:.6f}".format(memory.mean().item(), memory.std().item()))
+            except Exception:
+                pass
+            self._logged_stats_once = True
+
         return memory
 
     # ── Greedy decoding ───────────────────────
