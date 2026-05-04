@@ -86,6 +86,54 @@ class WarmupCosineScheduler:
 
 
 # ──────────────────────────────────────────────
+# Guided Attention Loss
+# ──────────────────────────────────────────────
+def guided_attention_loss(
+    attn: torch.Tensor,
+    src_lens: torch.Tensor,
+    tgt_lens: torch.Tensor,
+    sigma: float = 0.4,
+) -> torch.Tensor:
+    """Compute guided attention loss over a batch.
+
+    Args:
+        attn: attention maps of shape (B, L, T), typically from the last decoder layer.
+        src_lens: source valid lengths per sample.
+        tgt_lens: target valid lengths per sample, excluding padding positions used in attn.
+        sigma: width of the diagonal Gaussian.
+
+    Returns:
+        Scalar tensor with the average guided attention loss over valid samples.
+    """
+    if attn is None:
+        return torch.tensor(0.0, device=src_lens.device)
+
+    attn = attn.float()
+    device = attn.device
+    dtype = attn.dtype
+
+    losses = []
+    batch_size = attn.size(0)
+
+    for b in range(batch_size):
+        src_len = int(src_lens[b].item())
+        tgt_len = int(tgt_lens[b].item())
+        if src_len <= 0 or tgt_len <= 0:
+            continue
+
+        attn_b = attn[b, :tgt_len, :src_len]
+
+        t_idx = torch.arange(tgt_len, device=device, dtype=dtype).unsqueeze(1)
+        s_idx = torch.arange(src_len, device=device, dtype=dtype).unsqueeze(0)
+        w = 1.0 - torch.exp(-((t_idx / max(tgt_len, 1) - s_idx / max(src_len, 1)) ** 2) / (2.0 * sigma ** 2))
+        losses.append((w * attn_b).mean())
+
+    if not losses:
+        return torch.zeros((), device=device, dtype=dtype)
+    return torch.stack(losses).mean()
+
+
+# ──────────────────────────────────────────────
 # Training step
 # ──────────────────────────────────────────────
 def train_epoch(
@@ -98,9 +146,13 @@ def train_epoch(
     clip_norm: float,
     use_amp:   bool,
     log_interval: int,
+    gal_weight: float = 10.0,
+    gal_sigma: float = 0.25,
 ) -> dict:
     model.train()
     total_loss  = 0.0
+    total_ce_loss = 0.0
+    total_gal_loss = 0.0
     total_tok   = 0
     total_steps = 0
     t0          = time.time()
@@ -134,13 +186,31 @@ def train_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         with autocast(amp_device, enabled=use_amp):
-            _, loss = model(
-                src=src,
-                tgt_input=tgt_in,
-                tgt_output=tgt_out,
-                src_key_padding_mask=src_mask,
-                tgt_in_key_padding_mask=tin_mask,
-            )
+            if gal_weight > 0.0:
+                # The decoder returns attention only from its last layer, so GAL
+                # is applied exclusively to the topmost decoder cross-attention.
+                _, ce_loss, attn = model(
+                    src=src,
+                    tgt_input=tgt_in,
+                    tgt_output=tgt_out,
+                    src_key_padding_mask=src_mask,
+                    tgt_in_key_padding_mask=tin_mask,
+                    return_attn=True,
+                )
+                src_lens = (~src_mask).sum(dim=1)
+                tgt_lens = (~tin_mask).sum(dim=1)
+                gal_loss = guided_attention_loss(attn, src_lens, tgt_lens, sigma=gal_sigma)
+                loss = ce_loss + gal_weight * gal_loss
+            else:
+                _, ce_loss = model(
+                    src=src,
+                    tgt_input=tgt_in,
+                    tgt_output=tgt_out,
+                    src_key_padding_mask=src_mask,
+                    tgt_in_key_padding_mask=tin_mask,
+                )
+                gal_loss = torch.zeros((), device=device, dtype=ce_loss.dtype)
+                loss = ce_loss
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -152,6 +222,8 @@ def train_epoch(
 
         n_tok        = (tgt_out != model.pad_id).sum().item()
         total_loss  += loss.item() * n_tok
+        total_ce_loss += ce_loss.item() * n_tok
+        total_gal_loss += gal_loss.item() * n_tok
         total_tok   += n_tok
         total_steps += 1
 
@@ -167,9 +239,18 @@ def train_epoch(
             last_log_time = time.time()
 
     avg_loss = total_loss / max(1, total_tok)
-    ppl      = math.exp(min(avg_loss, 20))
+    avg_ce_loss = total_ce_loss / max(1, total_tok)
+    avg_gal_loss = total_gal_loss / max(1, total_tok)
+    ppl      = math.exp(min(avg_ce_loss, 20))
     elapsed  = time.time() - t0
-    return {"loss": avg_loss, "ppl": ppl, "steps": total_steps, "time": elapsed}
+    return {
+        "loss": avg_loss,
+        "ce_loss": avg_ce_loss,
+        "gal_loss": avg_gal_loss,
+        "ppl": ppl,
+        "steps": total_steps,
+        "time": elapsed,
+    }
 
 
 # ──────────────────────────────────────────────
@@ -342,6 +423,7 @@ def main(cfg: dict):
         dropout        = cfg["dropout"],
         max_src_len    = cfg["max_src_len"],
         max_tgt_len    = cfg["max_tgt_len"],
+        src_embedding_type = cfg.get("src_embedding_type", "mlp"),
         pad_id         = tokenizer.pad_id,
         label_smoothing= cfg["label_smoothing"],
     ).to(device)
@@ -477,6 +559,7 @@ if __name__ == "__main__":
         "label_smoothing":0.1,
         "max_src_len":    512,
         "max_tgt_len":    128,
+        "src_embedding_type": "mlp",
         "pose_weight":   1.0,
         "hand_weight":   1.3,
         "face_weight":   0.7,

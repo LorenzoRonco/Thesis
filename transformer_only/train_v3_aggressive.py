@@ -58,6 +58,8 @@ def main():
         "label_smoothing": 0.02,  # REDUCED from 0.05 (aggressive)
         "max_src_len": 256,
         "max_tgt_len": 128,
+        # Source embedding ablation: "mlp" | "temporal_cnn"
+        "src_embedding_type": "temporal_cnn",
         
         # Training - AGGRESSIVE
         "epochs": 100,
@@ -153,6 +155,7 @@ def main():
         dropout=cfg["dropout"],
         max_src_len=cfg["max_src_len"],
         max_tgt_len=cfg["max_tgt_len"],
+        src_embedding_type=cfg["src_embedding_type"],
         pad_id=tokenizer.pad_id,
         label_smoothing=cfg["label_smoothing"],
     )

@@ -147,6 +147,28 @@ def _load_checkpoint(checkpoint_path: Path, device: torch.device) -> dict:
     return torch.load(checkpoint_path, map_location=device)
 
 
+def _resolve_checkpoint_path(cfg: dict) -> Path:
+    checkpoint_value = cfg.get("checkpoint")
+    output_dir = Path(cfg.get("output_dir") or "outputs/run2_optimized")
+
+    candidates = []
+    if checkpoint_value:
+        candidates.append(Path(checkpoint_value))
+    candidates.extend([
+        output_dir / "best.pt",
+        output_dir / "last.pt",
+    ])
+
+    for candidate in candidates:
+        if candidate.exists():
+            if checkpoint_value and candidate != Path(checkpoint_value):
+                print(f"[EVAL] Checkpoint not found at {checkpoint_value}, using {candidate} instead.")
+            return candidate
+
+    searched = ", ".join(str(path) for path in candidates)
+    raise FileNotFoundError(f"Checkpoint not found. Searched: {searched}")
+
+
 def _load_tokenizer(cfg: dict) -> SentenceTokenizer:
     tok_path = Path(cfg["tokenizer_path"]) if cfg.get("tokenizer_path") else None
     if tok_path and tok_path.exists():
@@ -180,6 +202,36 @@ def _resolve_model_cfg(cli_cfg: dict, ckpt_cfg: dict) -> dict:
         "max_src_len": _pick("max_src_len", 512),
         "max_tgt_len": _pick("max_tgt_len", 128),
         "label_smoothing": _pick("label_smoothing", 0.1),
+        "src_embedding_type": _pick("src_embedding_type", "mlp"),
+        "temporal_kernel_size": _pick("temporal_kernel_size", None),
+        "temporal_blocks": _pick("temporal_blocks", None),
+    }
+
+
+def _infer_temporal_frontend_cfg(state_dict: dict) -> dict:
+    """Infer temporal CNN hyperparameters from checkpoint tensor shapes."""
+    kernel_size = None
+    blocks = None
+
+    in_proj_w = state_dict.get("src_embed.temporal_extractor.in_proj.weight")
+    if isinstance(in_proj_w, torch.Tensor) and in_proj_w.dim() == 3:
+        kernel_size = int(in_proj_w.shape[-1])
+
+    block_indices: set[int] = set()
+    prefix = "src_embed.temporal_extractor.blocks."
+    for key in state_dict.keys():
+        if not key.startswith(prefix):
+            continue
+        suffix = key[len(prefix):]
+        idx_str = suffix.split(".", 1)[0]
+        if idx_str.isdigit():
+            block_indices.add(int(idx_str))
+    if block_indices:
+        blocks = max(block_indices) + 1
+
+    return {
+        "temporal_kernel_size": kernel_size,
+        "temporal_blocks": blocks,
     }
 
 
@@ -198,16 +250,32 @@ def evaluate(cfg: dict) -> dict:
     device = torch.device(cfg["device"] if torch.cuda.is_available() else "cpu")
     use_amp = cfg.get("use_amp", True) and device.type == "cuda"
 
-    checkpoint_path = Path(cfg["checkpoint"]) 
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    checkpoint_path = _resolve_checkpoint_path(cfg)
 
     ckpt = _load_checkpoint(checkpoint_path, device)
     ckpt_cfg = ckpt.get("cfg", {})
 
+    state_dict = None
+    if isinstance(ckpt, dict):
+        if "model" in ckpt:
+            state_dict = ckpt["model"]
+        elif "model_state_dict" in ckpt:
+            state_dict = ckpt["model_state_dict"]
+    if state_dict is None:
+        state_dict = ckpt
+
     tokenizer = _load_tokenizer(cfg)
     model_cfg = _resolve_model_cfg(cfg, ckpt_cfg)
     data_weights = _resolve_data_weights(cfg, ckpt_cfg)
+
+    # Backward-compatible loading: older checkpoints may not store temporal CNN
+    # hyperparameters in cfg, so infer them from checkpoint shapes.
+    if model_cfg["src_embedding_type"] == "temporal_cnn":
+        inferred = _infer_temporal_frontend_cfg(state_dict)
+        if model_cfg.get("temporal_kernel_size") is None:
+            model_cfg["temporal_kernel_size"] = inferred["temporal_kernel_size"] or 5
+        if model_cfg.get("temporal_blocks") is None:
+            model_cfg["temporal_blocks"] = inferred["temporal_blocks"] or 3
 
     dataset = How2SignDataset(
         csv_path=cfg["val_csv"],
@@ -240,18 +308,12 @@ def evaluate(cfg: dict) -> dict:
         dropout=model_cfg["dropout"],
         max_src_len=model_cfg["max_src_len"],
         max_tgt_len=model_cfg["max_tgt_len"],
+        src_embedding_type=model_cfg["src_embedding_type"],
+        temporal_kernel_size=model_cfg["temporal_kernel_size"] or 5,
+        temporal_blocks=model_cfg["temporal_blocks"] or 3,
         pad_id=tokenizer.pad_id,
         label_smoothing=model_cfg["label_smoothing"],
     ).to(device)
-
-    state_dict = None
-    if isinstance(ckpt, dict):
-        if "model" in ckpt:
-            state_dict = ckpt["model"]
-        elif "model_state_dict" in ckpt:
-            state_dict = ckpt["model_state_dict"]
-    if state_dict is None:
-        state_dict = ckpt
 
     model.load_state_dict(state_dict)
     model.eval()
@@ -338,8 +400,8 @@ def _cleanup(device: torch.device):
 def main():
     batch_size_default = 8
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, default="outputs/run1/best.pt")
-    parser.add_argument("--output_dir", type=str, default="outputs/run1")
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--output_dir", type=str, default="outputs/run2_optimized")
     parser.add_argument("--tokenizer_path", type=str, default=None)
     parser.add_argument("--train_csv", type=str, default=None)
     parser.add_argument(

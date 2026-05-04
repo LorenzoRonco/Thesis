@@ -54,12 +54,84 @@ class SinusoidalPositionalEncoding(nn.Module):
 
 
 # ──────────────────────────────────────────────
+# Temporal CNN feature extractor (Conv1d)
+# ──────────────────────────────────────────────
+class TemporalConvBlock(nn.Module):
+    """
+    Residual Conv1d block for local temporal motion modeling.
+    Input/Output: (B, C, T)
+    """
+
+    def __init__(self, channels: int, kernel_size: int = 5, dropout: float = 0.1):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=padding)
+        self.bn1 = nn.GroupNorm(1, channels)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=padding)
+        self.bn2 = nn.GroupNorm(1, channels)
+
+    def forward(self, x: Tensor) -> Tensor:
+        residual = x
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = x + residual
+        x = self.act(x)
+        return x
+
+
+class TemporalConvFeatureExtractor(nn.Module):
+    """
+    Converts (B, T, F) continuous landmarks into (B, T, d_model) temporal motion features.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        d_model: int,
+        conv_dim: int,
+        num_blocks: int = 3,
+        kernel_size: int = 5,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        padding = kernel_size // 2
+        self.in_proj = nn.Conv1d(input_dim, conv_dim, kernel_size=kernel_size, padding=padding)
+        self.in_bn = nn.GroupNorm(1, conv_dim)
+        self.in_act = nn.GELU()
+        self.blocks = nn.Sequential(
+            *[TemporalConvBlock(conv_dim, kernel_size=kernel_size, dropout=dropout) for _ in range(num_blocks)]
+        )
+        self.out_proj = nn.Conv1d(conv_dim, d_model, kernel_size=1)
+        self.out_norm = nn.LayerNorm(d_model)
+
+    def forward(self, src: Tensor) -> Tensor:
+        # src: (B, T, F) -> Conv1d expects (B, F, T)
+        x = src.transpose(1, 2)
+        x = self.in_proj(x)
+        x = self.in_bn(x)
+        x = self.in_act(x)
+        x = self.blocks(x)
+        x = self.out_proj(x)
+        # back to (B, T, D)
+        x = x.transpose(1, 2)
+        x = self.out_norm(x)
+        return x
+
+
+# ──────────────────────────────────────────────
 # Proiezione landmarks → d_model
 # ──────────────────────────────────────────────
 class LandmarkEmbedding(nn.Module):
     """
-    Proietta i landmarks piatti (T, feat_dim=2108) nello spazio d_model
-    tramite un piccolo MLP + Layer Norm + Positional Encoding.
+    Proietta i landmarks piatti (T, feat_dim=2108) nello spazio d_model,
+    applica un vettore di pesatura apprendibile SiLT e poi inietta
+    informazione temporale con una Bi-GRU.
 
     Opzionalmente impara un embedding per il tipo di landmark
     (face / pose / left_hand / right_hand) sommato all'input.
@@ -72,30 +144,69 @@ class LandmarkEmbedding(nn.Module):
         max_len: int = 4096,
         dropout: float = 0.1,
         hidden_dim: int | None = None,
+        embedding_type: str = "mlp",
+        temporal_kernel_size: int = 5,
+        temporal_blocks: int = 3,
     ):
         super().__init__()
+        if d_model % 2 != 0:
+            raise ValueError("d_model must be even to use a bidirectional GRU with hidden_size=d_model//2")
         hidden_dim = hidden_dim or d_model * 2
-
-        self.proj = nn.Sequential(
-            nn.Linear(feat_dim, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, d_model),
+        self.silt_weights = nn.Parameter(torch.ones(1, d_model))
+        self.bigru = nn.GRU(
+            input_size=d_model,
+            hidden_size=d_model // 2,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
         )
-        self.norm = nn.LayerNorm(d_model)
-        self.pos_enc = SinusoidalPositionalEncoding(d_model, max_len, dropout)
 
-    def forward(self, src: Tensor) -> Tensor:
+        self.d_model = d_model
+        self.embedding_type = embedding_type
+        self.proj = None
+        self.temporal_extractor = None
+
+        if self.embedding_type == "mlp":
+            # Original embedding path (per-frame projection).
+            self.proj = nn.Sequential(
+                nn.Linear(feat_dim, hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, d_model),
+            )
+        elif self.embedding_type == "temporal_cnn":
+            # Temporal feature extraction before positional encoding to reduce frame shortcut learning.
+            self.temporal_extractor = TemporalConvFeatureExtractor(
+                input_dim=feat_dim,
+                d_model=d_model,
+                conv_dim=hidden_dim,
+                num_blocks=temporal_blocks,
+                kernel_size=temporal_kernel_size,
+                dropout=dropout,
+            )
+        else:
+            raise ValueError(
+                f"Unknown embedding_type '{self.embedding_type}'. Supported: 'mlp', 'temporal_cnn'"
+            )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, src: Tensor, src_key_padding_mask: Tensor | None = None) -> Tensor:
         """src: (B, T, feat_dim) → (B, T, d_model)"""
-        x = self.proj(src)
-        x = self.norm(x)
-        if getattr(self, "debug_positional_encoding", False) and not getattr(self, "_logged_pe_once", False):
-            pe_slice = self.pos_enc.pe[:, : x.size(1)]
-            pe_delta = (pe_slice[:, 1] - pe_slice[:, 0]).abs().mean().item() if x.size(1) > 1 else 0.0
-            pe_std = pe_slice.std().item()
-            print(f"[PosEnc Debug] src_len={x.size(1)} pe_std={pe_std:.6f} pe_delta01={pe_delta:.6f}")
-            self._logged_pe_once = True
-        return self.pos_enc(x)
+        if self.embedding_type == "mlp":
+            x = self.proj(src)
+        else:
+            x = self.temporal_extractor(src)
+        x = x * self.silt_weights
+
+        if src_key_padding_mask is not None:
+            lengths = (~src_key_padding_mask).sum(dim=1).clamp(min=1).to(torch.long).cpu()
+            packed = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
+            packed_out, _ = self.bigru(packed)
+            x, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True, total_length=src.size(1))
+        else:
+            x, _ = self.bigru(x)
+
+        return self.norm(x)
 
 
 # ──────────────────────────────────────────────
@@ -106,12 +217,203 @@ class TokenEmbedding(nn.Module):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.scale     = math.sqrt(d_model)
-        self.pos_enc   = SinusoidalPositionalEncoding(d_model, max_len, dropout)
+        self.gru = nn.GRU(
+            input_size=d_model,
+            hidden_size=d_model,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=False,
+        )
 
-    def forward(self, tgt: Tensor) -> Tensor:
+    def forward(self, tgt: Tensor, tgt_key_padding_mask: Tensor | None = None) -> Tensor:
         """tgt: (B, L) → (B, L, d_model)"""
         x = self.embedding(tgt) * self.scale
-        return self.pos_enc(x)
+        if tgt_key_padding_mask is not None:
+            lengths = (~tgt_key_padding_mask).sum(dim=1).clamp(min=1).to(torch.long).cpu()
+            packed = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
+            packed_out, _ = self.gru(packed)
+            x, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True, total_length=tgt.size(1))
+        else:
+            x, _ = self.gru(x)
+        return x
+
+
+# ──────────────────────────────────────────────
+# Transformer decoder con ritorno delle attention map
+# ──────────────────────────────────────────────
+class TransformerDecoderLayerWithAttn(nn.Module):
+    """Decoder layer che può restituire le cross-attention medie dell'ultimo layer."""
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+        batch_first: bool = True,
+        norm_first: bool = True,
+    ):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(
+            d_model,
+            nhead,
+            dropout=dropout,
+            batch_first=batch_first,
+        )
+        self.multihead_attn = nn.MultiheadAttention(
+            d_model,
+            nhead,
+            dropout=dropout,
+            batch_first=batch_first,
+        )
+
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+
+        self.dropout = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+        self.norm_first = norm_first
+
+        if activation == "gelu":
+            self.activation = F.gelu
+        elif activation == "relu":
+            self.activation = F.relu
+        else:
+            raise ValueError(f"Unsupported activation '{activation}'")
+
+    def _sa_block(
+        self,
+        x: Tensor,
+        tgt_mask: Tensor | None,
+        tgt_key_padding_mask: Tensor | None,
+    ) -> Tensor:
+        attn_out, _ = self.self_attn(
+            x,
+            x,
+            x,
+            attn_mask=tgt_mask,
+            key_padding_mask=tgt_key_padding_mask,
+            need_weights=False,
+        )
+        return self.dropout1(attn_out)
+
+    def _mha_block(
+        self,
+        x: Tensor,
+        mem: Tensor,
+        memory_mask: Tensor | None,
+        memory_key_padding_mask: Tensor | None,
+        return_attn: bool,
+    ) -> tuple[Tensor, Tensor | None]:
+        attn_out, attn_weights = self.multihead_attn(
+            x,
+            mem,
+            mem,
+            attn_mask=memory_mask,
+            key_padding_mask=memory_key_padding_mask,
+            need_weights=return_attn,
+            average_attn_weights=True,
+        )
+        return self.dropout2(attn_out), attn_weights if return_attn else None
+
+    def _ff_block(self, x: Tensor) -> Tensor:
+        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        return self.dropout3(x)
+
+    def forward(
+        self,
+        tgt: Tensor,
+        memory: Tensor,
+        tgt_mask: Tensor | None = None,
+        memory_mask: Tensor | None = None,
+        tgt_key_padding_mask: Tensor | None = None,
+        memory_key_padding_mask: Tensor | None = None,
+        return_attn: bool = False,
+    ) -> tuple[Tensor, Tensor | None]:
+        x = tgt
+        attn_weights = None
+
+        if self.norm_first:
+            x = x + self._sa_block(self.norm1(x), tgt_mask, tgt_key_padding_mask)
+            mha_out, attn_weights = self._mha_block(
+                self.norm2(x),
+                memory,
+                memory_mask,
+                memory_key_padding_mask,
+                return_attn,
+            )
+            x = x + mha_out
+            x = x + self._ff_block(self.norm3(x))
+        else:
+            x = self.norm1(x + self._sa_block(x, tgt_mask, tgt_key_padding_mask))
+            mha_out, attn_weights = self._mha_block(
+                x,
+                memory,
+                memory_mask,
+                memory_key_padding_mask,
+                return_attn,
+            )
+            x = self.norm2(x + mha_out)
+            x = self.norm3(x + self._ff_block(x))
+
+        return x, attn_weights
+
+
+class TransformerDecoderWithAttn(nn.Module):
+    """Stack di decoder layers che può restituire le attention map dell'ultimo layer."""
+
+    def __init__(
+        self,
+        decoder_layer: TransformerDecoderLayerWithAttn,
+        num_layers: int,
+        norm: nn.Module | None = None,
+    ):
+        super().__init__()
+        self.layers = nn.ModuleList([decoder_layer if i == 0 else self._clone_layer(decoder_layer) for i in range(num_layers)])
+        self.num_layers = num_layers
+        self.norm = norm
+
+    @staticmethod
+    def _clone_layer(layer: TransformerDecoderLayerWithAttn) -> TransformerDecoderLayerWithAttn:
+        import copy
+
+        return copy.deepcopy(layer)
+
+    def forward(
+        self,
+        tgt: Tensor,
+        memory: Tensor,
+        tgt_mask: Tensor | None = None,
+        memory_mask: Tensor | None = None,
+        tgt_key_padding_mask: Tensor | None = None,
+        memory_key_padding_mask: Tensor | None = None,
+        return_attn: bool = False,
+    ) -> tuple[Tensor, Tensor | None]:
+        output = tgt
+        last_attn = None
+
+        for layer_idx, layer in enumerate(self.layers):
+            output, last_attn = layer(
+                output,
+                memory,
+                tgt_mask=tgt_mask,
+                memory_mask=memory_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+                return_attn=return_attn and (layer_idx == len(self.layers) - 1),
+            )
+
+        if self.norm is not None:
+            output = self.norm(output)
+
+        return output, last_attn if return_attn else None
 
 
 # ──────────────────────────────────────────────
@@ -142,20 +444,22 @@ class SignLanguageTransformer(nn.Module):
         vocab_size:     int   = 5000,
         d_model:        int   = 512,
         nhead:          int   = 8,
-        num_enc_layers: int   = 6,
-        num_dec_layers: int   = 6,
-        dim_feedforward: int  = 2048,
+        num_enc_layers: int   = 3,
+        num_dec_layers: int   = 3,
+        dim_feedforward: int  =1024,
         dropout:        float = 0.1,
         max_src_len:    int   = 1024,
         max_tgt_len:    int   = 256,
         pad_id:         int   = 0,
-        label_smoothing: float = 0.1,
+        label_smoothing: float = 0.3,
+        src_embedding_type: str = "mlp",
+        temporal_kernel_size: int = 5,
+        temporal_blocks: int = 3,
     ):
         super().__init__()
 
         self.d_model   = d_model
         self.pad_id    = pad_id
-        self.debug_positional_encoding = False
 
         # ── Embedding ─────────────────────────
         self.src_embed = LandmarkEmbedding(
@@ -163,8 +467,11 @@ class SignLanguageTransformer(nn.Module):
             d_model=d_model,
             max_len=max_src_len,
             dropout=dropout,
+            embedding_type=src_embedding_type,
+            temporal_kernel_size=temporal_kernel_size,
+            temporal_blocks=temporal_blocks,
+            hidden_dim=d_model,
         )
-        self.src_embed.debug_positional_encoding = self.debug_positional_encoding
         self.tgt_embed = TokenEmbedding(
             vocab_size=vocab_size,
             d_model=d_model,
@@ -189,7 +496,7 @@ class SignLanguageTransformer(nn.Module):
         )
 
         # ── Decoder ───────────────────────────
-        dec_layer = nn.TransformerDecoderLayer(
+        dec_layer = TransformerDecoderLayerWithAttn(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
@@ -198,7 +505,7 @@ class SignLanguageTransformer(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.decoder = nn.TransformerDecoder(
+        self.decoder = TransformerDecoderWithAttn(
             dec_layer,
             num_layers=num_dec_layers,
             norm=nn.LayerNorm(d_model),
@@ -252,11 +559,13 @@ class SignLanguageTransformer(nn.Module):
         tgt_output:             Tensor,                  # (B, L-1)
         src_key_padding_mask:   Tensor | None = None,   # (B, T) True=pad
         tgt_in_key_padding_mask: Tensor | None = None,  # (B, L-1)
-    ) -> tuple[Tensor, Tensor]:
+        return_attn: bool = False,
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor | None]:
         """
         Ritorna:
             logits: (B, L-1, vocab_size)
             loss:   scalar
+            attn:   (B, L-1, T) se return_attn=True
         """
         B, T, _ = src.shape
         L = tgt_input.shape[1]
@@ -267,14 +576,15 @@ class SignLanguageTransformer(nn.Module):
 
         # ── Decode ────────────────────────────
         causal_mask = self._make_causal_mask(L, device)   # (L, L)
-        tgt_emb = self.tgt_embed(tgt_input)               # (B, L, d_model)
+        tgt_emb = self.tgt_embed(tgt_input, tgt_in_key_padding_mask)               # (B, L, d_model)
 
-        dec_out = self.decoder(
+        dec_out, cross_attn = self.decoder(
             tgt=tgt_emb,
             memory=memory,
             tgt_mask=causal_mask,
             tgt_key_padding_mask=tgt_in_key_padding_mask,
             memory_key_padding_mask=src_key_padding_mask,
+            return_attn=return_attn,
         )                                                  # (B, L, d_model)
 
         logits = self.output_proj(dec_out)                 # (B, L, V)
@@ -285,6 +595,8 @@ class SignLanguageTransformer(nn.Module):
             tgt_output.reshape(-1),                        # (B*L,)
         )
 
+        if return_attn:
+            return logits, loss, cross_attn
         return logits, loss
 
     def encode(
@@ -293,8 +605,14 @@ class SignLanguageTransformer(nn.Module):
         src_key_padding_mask: Tensor | None = None,
     ) -> Tensor:
         """Restituisce le rappresentazioni encoder: (B, T, d_model)"""
-        self.src_embed.debug_positional_encoding = getattr(self, "debug_positional_encoding", False)
-        src_emb = self.src_embed(src)             # (B, T, d_model)
+        src_emb = self.src_embed(src, src_key_padding_mask)             # (B, T, d_model)
+
+        # Ensure padded positions remain zeroed after the CNN/embedding pipeline so
+        # they cannot leak non-zero values (due to conv/bias) into attention.
+        # src_key_padding_mask: (B, T) with True==pad
+        if src_key_padding_mask is not None:
+            mask = src_key_padding_mask.unsqueeze(-1)  # (B, T, 1)
+            src_emb = src_emb.masked_fill(mask, 0.0)
 
         # Optional diagnostic printing: show stats of raw src, src_emb and memory once
         if getattr(self, "debug_log_stats", False) and not getattr(self, "_logged_stats_once", False):
@@ -308,6 +626,12 @@ class SignLanguageTransformer(nn.Module):
             src_emb,
             src_key_padding_mask=src_key_padding_mask,
         )
+
+        # Also force encoder outputs (memory) at padded positions to zero so that
+        # cross-attention cannot attend to "dirty" positions created by convs.
+        if src_key_padding_mask is not None:
+            mask = src_key_padding_mask.unsqueeze(-1)
+            memory = memory.masked_fill(mask, 0.0)
 
         if getattr(self, "debug_log_stats", False) and not getattr(self, "_logged_stats_once", False):
             try:
@@ -345,7 +669,7 @@ class SignLanguageTransformer(nn.Module):
             L = ys.size(1)
             causal = self._make_causal_mask(L, device)
             tgt_emb = self.tgt_embed(ys)
-            dec_out = self.decoder(
+            dec_out, _ = self.decoder(
                 tgt=tgt_emb,
                 memory=memory,
                 tgt_mask=causal,
@@ -364,7 +688,6 @@ class SignLanguageTransformer(nn.Module):
 
             if finished.all():
                 break
-
             ys = torch.cat([ys, next_id.unsqueeze(1)], dim=1)
 
         return results
@@ -403,7 +726,7 @@ class SignLanguageTransformer(nn.Module):
                 L  = ys.size(1)
                 causal  = self._make_causal_mask(L, device)
                 tgt_emb = self.tgt_embed(ys)
-                dec_out = self.decoder(
+                dec_out, _ = self.decoder(
                     tgt=tgt_emb,
                     memory=memory,
                     tgt_mask=causal,

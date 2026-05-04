@@ -49,6 +49,9 @@ class SentenceTokenizer:
     Tokenizer word-level semplice.
     Costruisce il vocabolario dai dati di training; i token speciali
     sono inseriti agli indici 0-3 per compatibilità con il decoder.
+    
+    Args:
+        min_freq: scarta parole che appaiono meno di min_freq volte (default 1, no filtering).
     """
 
     PAD_TOKEN = "<pad>"
@@ -56,7 +59,8 @@ class SentenceTokenizer:
     EOS_TOKEN = "<eos>"
     UNK_TOKEN = "<unk>"
 
-    def __init__(self):
+    def __init__(self, min_freq: int = 1):
+        self.min_freq = min_freq
         self.token2idx: dict[str, int] = {}
         self.idx2token: dict[int, str] = {}
         self._build_specials()
@@ -90,13 +94,25 @@ class SentenceTokenizer:
 
     # ── costruzione vocabolario ───────────────
     def build_from_sentences(self, sentences: list[str]):
-        """Costruisce il vocabolario da una lista di frasi."""
+        """Costruisce il vocabolario da una lista di frasi.
+        
+        Conta la frequenza di ogni parola e aggiunge al vocabolario solo
+        quelle che appaiono almeno min_freq volte.
+        """
+        from collections import Counter
+        
+        # Conteggia frequenze
+        word_counts = Counter()
         for sent in sentences:
             for word in self._split(sent):
-                if word not in self.token2idx:
-                    idx = len(self.token2idx)
-                    self.token2idx[word] = idx
-                    self.idx2token[idx] = word
+                word_counts[word] += 1
+        
+        # Aggiungi solo parole con frequenza >= min_freq
+        for word, count in word_counts.most_common():
+            if count >= self.min_freq:
+                idx = len(self.token2idx)
+                self.token2idx[word] = idx
+                self.idx2token[idx] = word
 
     @staticmethod
     def _split(sentence: str) -> list[str]:
@@ -121,15 +137,26 @@ class SentenceTokenizer:
     # ── salvataggio / caricamento ─────────────
     def save(self, path: str | Path):
         import json
+        meta = {"min_freq": self.min_freq, "vocab": self.token2idx}
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.token2idx, f, ensure_ascii=False, indent=2)
+            json.dump(meta, f, ensure_ascii=False, indent=2)
 
     @classmethod
     def load(cls, path: str | Path) -> "SentenceTokenizer":
         import json
-        tok = cls()
         with open(path, "r", encoding="utf-8") as f:
-            tok.token2idx = json.load(f)
+            data = json.load(f)
+        
+        # Backward compatibility: handle both old format (plain dict) and new (dict with "vocab" key)
+        if isinstance(data, dict) and "vocab" in data:
+            min_freq = data.get("min_freq", 1)
+            vocab = data["vocab"]
+        else:
+            min_freq = 1
+            vocab = data
+        
+        tok = cls(min_freq=min_freq)
+        tok.token2idx = vocab
         tok.idx2token = {v: k for k, v in tok.token2idx.items()}
         return tok
 
@@ -386,7 +413,14 @@ class How2SignDataset(Dataset):
 # ─────────────────────────────────────────────
 # Collate function (padding)
 # ─────────────────────────────────────────────
-def collate_fn(batch: list[dict], pad_id: int = 0) -> dict:
+def collate_fn(
+    batch: list[dict],
+    pad_id: int = 0,
+    bos_id: int = 1,
+    unk_id: int = 3,
+    eos_id: int = 2,
+    word_dropout_prob: float = 0.0,
+) -> dict:
     """
     Padda sorgente e target alla lunghezza massima del batch.
     Restituisce:
@@ -431,6 +465,18 @@ def collate_fn(batch: list[dict], pad_id: int = 0) -> dict:
     tgt_output = tgt_padded[:, 1:]    # ... <eos> (senza <bos>)
     tgt_in_mask  = tgt_mask[:, :-1]
     tgt_out_mask = tgt_mask[:, 1:]
+
+    # Word dropout on tgt_input (do not replace pad, bos, or the token whose
+    # corresponding tgt_output is <eos>; replacement token is <unk>)
+    if word_dropout_prob and word_dropout_prob > 0.0:
+        # candidate positions: not pad, not bos, and not the token before <eos>
+        # tgt_input: (B, L-1), tgt_output: (B, L-1)
+        valid = (tgt_input != pad_id) & (tgt_input != bos_id) & (tgt_output != eos_id) & (tgt_output != pad_id)
+        # sample dropout mask
+        rand = torch.rand_like(tgt_input, dtype=torch.float)
+        drop_mask = (rand < word_dropout_prob) & valid
+        if drop_mask.any():
+            tgt_input = tgt_input.masked_fill(drop_mask, unk_id)
 
     return {
         "src":                    src_padded,    # (B, T, D)
@@ -507,11 +553,17 @@ class BucketingBatchSampler(Sampler[list[int]]):
 def build_tokenizer(
     train_csv: str | Path,
     save_path: Optional[str | Path] = None,
+    min_freq: int = 1,
 ) -> SentenceTokenizer:
     """
     Costruisce e (opzionalmente) salva il tokenizer dal CSV di training.
+    
+    Args:
+        train_csv: path al CSV di training con colonna "SENTENCE".
+        save_path: path dove salvare il tokenizer serializzato.
+        min_freq: scarta parole che appaiono meno di min_freq volte (default 1, no filtering).
     """
-    tokenizer = SentenceTokenizer()
+    tokenizer = SentenceTokenizer(min_freq=min_freq)
     sentences = []
     with open(train_csv, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter="\t")
@@ -521,7 +573,7 @@ def build_tokenizer(
                 sentences.append(s)
     tokenizer.build_from_sentences(sentences)
     print(f"[build_tokenizer] Vocabolario: {tokenizer.vocab_size} token "
-          f"da {len(sentences)} frasi")
+          f"da {len(sentences)} frasi (min_freq={min_freq})")
     if save_path:
         tokenizer.save(save_path)
         print(f"[build_tokenizer] Salvato in {save_path}")
@@ -556,12 +608,20 @@ def build_dataloaders(
     thumb_dropout_prob: float = 0.0,
     hand_landmark_dropout_prob: float = 0.0,
     hand_noise_std: float = 0.0,
+    target_word_dropout: float = 0.0,
 ) -> dict[str, DataLoader]:
     """
     Restituisce un dizionario {"train": ..., "val": ..., "test": ...}.
     """
     from functools import partial
-    _collate = partial(collate_fn, pad_id=tokenizer.pad_id)
+    _collate = partial(
+        collate_fn,
+        pad_id=tokenizer.pad_id,
+        bos_id=tokenizer.bos_id,
+        unk_id=tokenizer.unk_id,
+        eos_id=tokenizer.eos_id,
+        word_dropout_prob=target_word_dropout,
+    )
 
     def _compute_src_lengths(ds: How2SignDataset) -> list[int]:
         lengths: list[int] = []

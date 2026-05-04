@@ -38,6 +38,15 @@ from transformer_only.attention_visualizer import debug_attention_on_batch
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Train SignLanguageTransformer with optimized hyperparameters")
+    parser.add_argument("--tokenizer_min_freq", type=int, default=None, help="Minimum word frequency to include in vocabulary (overrides config)")
+    parser.add_argument("--epochs", type=int, default=None, help="Number of epochs (overrides config)")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate (overrides config)")
+    parser.add_argument("--batch_size", type=int, default=None, help="Batch size (overrides config)")
+    parser.add_argument("--dropout", type=float, default=None, help="Dropout rate (overrides config)")
+    parser.add_argument("--target_word_dropout", type=float, default=None, help="Target word dropout probability (overrides config)")
+    args = parser.parse_args()
     # ─────── Configuration ─────────────────────────────────
     cfg = {
         "train_csv": "dataset/how2sign_realigned_train.csv",
@@ -52,13 +61,15 @@ def main():
         "feat_dim": 2108,
         "d_model": 512,
         "nhead": 8,
-        "num_enc_layers": 6,
-        "num_dec_layers": 6,
-        "dim_feedforward": 2048,
-        "dropout": 0.15,
+        "num_enc_layers": 3,
+        "num_dec_layers": 3,
+        "dim_feedforward": 1024,
+        "dropout": 0.3,
         "label_smoothing": 0.05,  # REDUCED from 0.1
         "max_src_len": 256,
         "max_tgt_len": 128,
+        # Source embedding ablation: "mlp" | "temporal_cnn"
+        "src_embedding_type": "temporal_cnn",
         
         # Training - OPTIMIZED
         "epochs": 100,
@@ -71,14 +82,21 @@ def main():
         
         # Data weighting - OPTIMIZED
         "pose_weight": 1.0,
-        "hand_weight": 1.5,  # INCREASED from 1.3
-        "face_weight": 0.5,  # REDUCED from 0.7
+        "hand_weight": 1.0,  # INCREASED from 1.3
+        "face_weight": 1.0,  # REDUCED from 0.7
 
         # Hand-focused normalization + augmentation (anti-sink)
         "use_hand_relative_norm": True,
         "thumb_dropout_prob": 0.20,
         "hand_landmark_dropout_prob": 0.03,
         "hand_noise_std": 0.015,
+        # Decoder word dropout (replace with <unk> during training)
+        "target_word_dropout": 0.15,
+        # Tokenizer minimum frequency (words appearing < min_freq times are mapped to <unk>)
+        "tokenizer_min_freq": 5,
+        # Guided Attention Loss
+        "gal_weight": 10.0,
+        "gal_sigma": 0.25,
         
         # Data sampling
         "train_subset_fraction": None,
@@ -94,13 +112,34 @@ def main():
         
         # Logging
         "log_interval": 50,
-        "val_interval": 1,
+        "val_interval_early": 10,  # Validate every N epochs for first 20 epochs
+        "val_interval_late": 5,  # Validate every N epochs after epoch 20
+        "early_phase_epochs": 20,  # Threshold between early and late phases
         "use_wandb": False,
         "debug_print_batch": False,
         "debug_max_items": 4,
         "debug_attention": True,  # Visualizza i pesi di cross-attention
-        "debug_attention_interval": 5,  # Ogni N epoch
+        "debug_attention_interval": 10,  # Ogni N epoch
     }
+    
+    # ─────── Override config from CLI arguments ───────────
+    if args.tokenizer_min_freq is not None:
+        cfg["tokenizer_min_freq"] = args.tokenizer_min_freq
+    if args.epochs is not None:
+        cfg["epochs"] = args.epochs
+    if args.lr is not None:
+        cfg["lr"] = args.lr
+    if args.batch_size is not None:
+        cfg["batch_size"] = args.batch_size
+    if args.dropout is not None:
+        cfg["dropout"] = args.dropout
+    if args.target_word_dropout is not None:
+        cfg["target_word_dropout"] = args.target_word_dropout
+    
+    # Log CLI overrides
+    cli_overrides = {k: v for k, v in vars(args).items() if v is not None}
+    if cli_overrides:
+        print(f"[RUN2] CLI overrides: {cli_overrides}")
     
     # Create output directory
     output_dir = Path(cfg["output_dir"])
@@ -119,7 +158,11 @@ def main():
     # ─────── Build data ────────────────────────────────────
     print("[RUN2] Building tokenizer and dataloaders...")
     tok_path = output_dir / "tokenizer.json"
-    tokenizer = build_tokenizer(cfg["train_csv"], save_path=tok_path)
+    tokenizer = build_tokenizer(
+        cfg["train_csv"],
+        save_path=tok_path,
+        min_freq=cfg.get("tokenizer_min_freq", 1),
+    )
     
     loaders = build_dataloaders(
         train_csv=cfg["train_csv"],
@@ -146,6 +189,7 @@ def main():
         thumb_dropout_prob=cfg["thumb_dropout_prob"],
         hand_landmark_dropout_prob=cfg["hand_landmark_dropout_prob"],
         hand_noise_std=cfg["hand_noise_std"],
+        target_word_dropout=cfg.get("target_word_dropout", 0.0),
     )
     train_loader = loaders["train"]
     val_loader = loaders["val"]
@@ -186,8 +230,11 @@ def main():
         dropout=cfg["dropout"],
         max_src_len=cfg["max_src_len"],
         max_tgt_len=cfg["max_tgt_len"],
+        src_embedding_type=cfg["src_embedding_type"],
         pad_id=tokenizer.pad_id,
         label_smoothing=cfg["label_smoothing"],
+        temporal_kernel_size=3,        # Passiamo esplicitamente il kernel a 3
+        temporal_blocks=1,             # Passiamo esplicitamente i blocchi a 1
     )
     model.to(device)
     # Enable model-level diagnostic stats logging if requested
@@ -232,10 +279,19 @@ def main():
             clip_norm=cfg["clip_norm"],
             use_amp=cfg["use_amp"],
             log_interval=cfg["log_interval"],
+            gal_weight=cfg.get("gal_weight", 10.0),
+            gal_sigma=cfg.get("gal_sigma", 0.25),
+        )
+        
+        # Determine validation interval based on phase
+        val_interval = (
+            cfg["val_interval_early"] 
+            if epoch <= cfg["early_phase_epochs"] 
+            else cfg["val_interval_late"]
         )
         
         # Validate
-        if epoch % cfg["val_interval"] == 0:
+        if epoch % val_interval == 0:
             val_stats = validate(
                 model=model,
                 loader=val_loader,
