@@ -495,6 +495,9 @@ class SignLanguageTransformer(nn.Module):
             norm=nn.LayerNorm(d_model),
         )
 
+        # ── CTC head ──────────────────────────
+        self.ctc_head = nn.Linear(d_model, vocab_size)
+
         # ── Decoder ───────────────────────────
         dec_layer = TransformerDecoderLayerWithAttn(
             d_model=d_model,
@@ -563,9 +566,9 @@ class SignLanguageTransformer(nn.Module):
     ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor | None]:
         """
         Ritorna:
-            logits: (B, L-1, vocab_size)
-            loss:   scalar
-            attn:   (B, L-1, T) se return_attn=True
+            ce_logits:  (B, L-1, vocab_size)
+            ctc_logits: (B, T, vocab_size)
+            attn:       (B, L-1, T) se return_attn=True
         """
         B, T, _ = src.shape
         L = tgt_input.shape[1]
@@ -573,6 +576,7 @@ class SignLanguageTransformer(nn.Module):
 
         # ── Encode ────────────────────────────
         memory = self.encode(src, src_key_padding_mask)   # (B, T, d_model)
+        ctc_logits = self.ctc_head(memory)                # (B, T, V)
 
         # ── Decode ────────────────────────────
         causal_mask = self._make_causal_mask(L, device)   # (L, L)
@@ -587,24 +591,23 @@ class SignLanguageTransformer(nn.Module):
             return_attn=return_attn,
         )                                                  # (B, L, d_model)
 
-        logits = self.output_proj(dec_out)                 # (B, L, V)
-
-        # ── Loss ──────────────────────────────
-        loss = self.criterion(
-            logits.reshape(-1, logits.size(-1)),           # (B*L, V)
-            tgt_output.reshape(-1),                        # (B*L,)
-        )
+        ce_logits = self.output_proj(dec_out)             # (B, L, V)
 
         if return_attn:
-            return logits, loss, cross_attn
-        return logits, loss
+            return ce_logits, ctc_logits, cross_attn
+        return ce_logits, ctc_logits
 
     def encode(
         self,
         src: Tensor,                              # (B, T, feat_dim)
         src_key_padding_mask: Tensor | None = None,
-    ) -> Tensor:
-        """Restituisce le rappresentazioni encoder: (B, T, d_model)"""
+        return_ctc_logits: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        """Restituisce le rappresentazioni encoder: (B, T, d_model).
+
+        Se return_ctc_logits=True, ritorna anche i logit della testa CTC
+        applicata direttamente sull'output dell'encoder.
+        """
         src_emb = self.src_embed(src, src_key_padding_mask)             # (B, T, d_model)
 
         # Ensure padded positions remain zeroed after the CNN/embedding pipeline so
@@ -640,6 +643,8 @@ class SignLanguageTransformer(nn.Module):
                 pass
             self._logged_stats_once = True
 
+        if return_ctc_logits:
+            return memory, self.ctc_head(memory)
         return memory
 
     # ── Greedy decoding ───────────────────────

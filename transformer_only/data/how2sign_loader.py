@@ -234,12 +234,33 @@ class How2SignDataset(Dataset):
         self.samples: list[dict] = []
         self._load_csv(csv_path)
         self._apply_subset()
+        # Infer dataset feature dim from first sample and validate normalize_stats
+        self._dataset_feat_dim = None
+        if self.samples:
+            try:
+                first = np.load(self.samples[0]["npy_path"])
+                if first.ndim == 2:
+                    n_landmarks_ds = first.shape[1] // N_DIMS
+                else:
+                    n_landmarks_ds = first.shape[1]
+                feat_dim_ds = int(n_landmarks_ds * N_DIMS)
+                self._dataset_feat_dim = feat_dim_ds
+                if self._norm_mean is not None and self._norm_mean.shape[0] != feat_dim_ds:
+                    print(
+                        f"[How2SignDataset] Warning: normalize_stats dimension ({self._norm_mean.shape[0]}) "
+                        f"does not match dataset feat_dim ({feat_dim_ds}). Disabling normalization."
+                    )
+                    self._norm_mean = None
+                    self._norm_std = None
+            except Exception as e:
+                print(f"[How2SignDataset] Could not infer dataset feature dim: {e}")
+                self._dataset_feat_dim = None
 
     def _apply_hand_relative_normalization(self, lm: torch.Tensor) -> torch.Tensor:
         """
         Normalize hand landmarks relative to their wrist for each frame.
         Keeps confidence channel unchanged.
-        lm shape: (T, 527, 4)
+        lm shape: (T, N_landmarks, 4)
         """
         # Global indices in this project layout:
         # pose [0:17), left hand [17:38), right hand [38:59), face [59:527)
@@ -258,7 +279,7 @@ class How2SignDataset(Dataset):
         """
         Data augmentation for hands: thumb dropout, random hand-point dropout, gaussian noise.
         Applied only during training dataset.
-        lm shape: (T, 527, 4)
+        lm shape: (T, N_landmarks, 4)
         """
         if not self.augment:
             return lm
@@ -346,14 +367,28 @@ class How2SignDataset(Dataset):
         sample = self.samples[idx]
 
         # ── Carica landmarks ──────────────────
-        lm = np.load(sample["npy_path"])        # (T, 527, 4) oppure (T, 2108)
+        lm = np.load(sample["npy_path"])        # (T, N_landmarks, 4) oppure flatten
         lm = torch.from_numpy(lm).float()
 
-        # Normalizza shape a (T, 527, 4)
+        # Normalizza shape a (T, N_landmarks, 4)
         if lm.ndim == 2:
-            # già flatten: (T, 2108) → (T, 527, 4)
+            # già flatten: (T, feat_dim) -> (T, N_landmarks, 4)
             T = lm.shape[0]
-            lm = lm.view(T, N_LANDMARKS, N_DIMS)
+            if lm.shape[1] % N_DIMS != 0:
+                raise ValueError(
+                    f"Feature dim {lm.shape[1]} non divisibile per N_DIMS={N_DIMS} "
+                    f"nel file {sample['npy_path']}"
+                )
+            n_landmarks = lm.shape[1] // N_DIMS
+            lm = lm.view(T, n_landmarks, N_DIMS)
+        elif lm.ndim == 3:
+            n_landmarks = lm.shape[1]
+        else:
+            raise ValueError(
+                f"Shape landmarks non supportata {tuple(lm.shape)} nel file {sample['npy_path']}"
+            )
+
+        feat_dim = n_landmarks * N_DIMS
 
         # Tronca temporalmente
         if self.max_src_len and lm.shape[0] > self.max_src_len:
@@ -368,9 +403,9 @@ class How2SignDataset(Dataset):
             # _norm_mean/std have shape (FEAT_DIM,) for flattened representation
             # Apply per-frame standardization
             T = lm.shape[0]
-            flat = lm.view(T, FEAT_DIM).numpy()
+            flat = lm.view(T, feat_dim).numpy()
             flat = (flat - self._norm_mean) / (self._norm_std + 1e-6)
-            lm = torch.from_numpy(flat).float().view(T, N_LANDMARKS, N_DIMS)
+            lm = torch.from_numpy(flat).float().view(T, n_landmarks, N_DIMS)
 
         # Training-only hand augmentation (finger dropout + noise)
         lm = self._apply_hand_augmentation(lm)
@@ -379,6 +414,11 @@ class How2SignDataset(Dataset):
         pose_end = POSE_LANDMARKS
         left_end = pose_end + LEFT_HAND_LANDMARKS
         right_end = left_end + RIGHT_HAND_LANDMARKS
+        if n_landmarks < right_end:
+            raise ValueError(
+                f"Numero landmarks insufficiente ({n_landmarks}) per pose+mani ({right_end}) "
+                f"nel file {sample['npy_path']}"
+            )
         if self.pose_weight != 1.0:
             lm[:, :pose_end, :] *= self.pose_weight
         if self.hand_weight != 1.0:
@@ -390,7 +430,7 @@ class How2SignDataset(Dataset):
         # Output shape sorgente
         if self.flatten:
             T = lm.shape[0]
-            lm = lm.view(T, FEAT_DIM)           # (T, 2108)
+            lm = lm.view(T, feat_dim)           # (T, feat_dim)
 
         # ── Tokenizza target ──────────────────
         tgt_ids = self.tokenizer.encode(sample["sentence"], add_special_tokens=True)

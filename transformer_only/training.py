@@ -19,6 +19,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 
 from transformer_only.data.how2sign_loader import build_tokenizer, build_dataloaders, SentenceTokenizer
@@ -133,6 +134,96 @@ def guided_attention_loss(
     return torch.stack(losses).mean()
 
 
+def _unpack_model_outputs(outputs):
+    """Supporta sia il vecchio forward che il nuovo forward con logits CE/CTC."""
+    if not isinstance(outputs, (tuple, list)):
+        return outputs, None, None, None
+
+    if len(outputs) >= 2 and torch.is_tensor(outputs[1]) and outputs[1].dim() == 0:
+        ce_logits = outputs[0]
+        ce_loss = outputs[1]
+        attn = outputs[2] if len(outputs) > 2 else None
+        return ce_logits, None, ce_loss, attn
+
+    ce_logits = outputs[0]
+    ctc_logits = outputs[1] if len(outputs) > 1 else None
+    attn = outputs[2] if len(outputs) > 2 else None
+    return ce_logits, ctc_logits, None, attn
+
+
+def _prepare_ctc_targets(
+    tgt: torch.Tensor,
+    tgt_lens: torch.Tensor,
+    pad_id: int,
+    bos_id: int = 1,
+    eos_id: int = 2,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Converte target padded in formato piatto richiesto da CTCLoss.
+
+    Assunzione: tgt_lens contiene la lunghezza reale della frase senza pad, bos, eos.
+    """
+    flat_targets = []
+    target_lengths = []
+
+    for idx in range(tgt.size(0)):
+        seq_len = int(tgt_lens[idx].item())
+        if seq_len <= 0:
+            target_lengths.append(0)
+            continue
+
+        seq = tgt[idx, 1:1 + seq_len]
+        seq = seq[(seq != pad_id) & (seq != bos_id) & (seq != eos_id)]
+        target_lengths.append(int(seq.numel()))
+        if seq.numel() > 0:
+            flat_targets.append(seq)
+
+    if flat_targets:
+        flat_targets = torch.cat(flat_targets, dim=0)
+    else:
+        flat_targets = torch.empty(0, dtype=tgt.dtype, device=tgt.device)
+
+    target_lengths = torch.tensor(target_lengths, dtype=torch.long, device=tgt.device)
+    return flat_targets, target_lengths
+
+
+def joint_ctc_attention_step(
+    model: SignLanguageTransformer,
+    src: torch.Tensor,
+    tgt: torch.Tensor,
+    src_lens: torch.Tensor,
+    tgt_lens: torch.Tensor,
+    lambda_ctc: float,
+    ce_criterion: nn.Module,
+    ctc_criterion: nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One joint CTC-Attention step for tuple-based batches."""
+    tgt_input = tgt[:, :-1]
+    tgt_expected = tgt[:, 1:]
+
+    ce_logits, ctc_logits = model(src, tgt_input=tgt_input, tgt_output=tgt_expected)
+
+    ce_loss = ce_criterion(
+        ce_logits.reshape(-1, ce_logits.size(-1)),
+        tgt_expected.reshape(-1),
+    )
+
+    log_probs = F.log_softmax(ctc_logits, dim=-1).transpose(0, 1)
+    targets_flat, target_lengths = _prepare_ctc_targets(
+        tgt=tgt,
+        tgt_lens=tgt_lens,
+        pad_id=model.pad_id,
+    )
+    ctc_loss = ctc_criterion(
+        log_probs,
+        targets_flat,
+        src_lens.to(torch.long),
+        target_lengths,
+    )
+
+    loss = ce_loss + (lambda_ctc * ctc_loss)
+    return loss, ce_loss, ctc_loss
+
+
 # ──────────────────────────────────────────────
 # Training step
 # ──────────────────────────────────────────────
@@ -146,27 +237,34 @@ def train_epoch(
     clip_norm: float,
     use_amp:   bool,
     log_interval: int,
-    gal_weight: float = 10.0,
+    gal_weight: float = 0.0,
     gal_sigma: float = 0.25,
+    lambda_ctc: float = 0.3,
+    ctc_blank: int = 0,
 ) -> dict:
     model.train()
     total_loss  = 0.0
     total_ce_loss = 0.0
+    total_ctc_loss = 0.0
     total_gal_loss = 0.0
     total_tok   = 0
     total_steps = 0
     t0          = time.time()
 
     amp_device = "cuda" if device.type == "cuda" else "cpu"
+    ce_criterion = nn.CrossEntropyLoss(ignore_index=model.pad_id)
+    ctc_criterion = nn.CTCLoss(blank=ctc_blank, zero_infinity=True)
 
     last_log_time = time.time()
 
     for batch in loader:
         src      = batch["src"].to(device, non_blocking=True)
+        tgt      = batch["tgt"].to(device, non_blocking=True)
         tgt_in   = batch["tgt_input"].to(device, non_blocking=True)
         tgt_out  = batch["tgt_output"].to(device, non_blocking=True)
         src_mask = batch["src_key_padding_mask"].to(device, non_blocking=True)
         tin_mask = batch["tgt_in_key_padding_mask"].to(device, non_blocking=True)
+        tgt_lens = batch["tgt_lens"].to(device, non_blocking=True)
 
         if not hasattr(train_epoch, "_logged_padding"):
             src_lens = batch.get("src_lens")
@@ -186,31 +284,54 @@ def train_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         with autocast(amp_device, enabled=use_amp):
-            if gal_weight > 0.0:
+            outputs = model(
+                src=src,
+                tgt_input=tgt_in,
+                tgt_output=tgt_out,
+                src_key_padding_mask=src_mask,
+                tgt_in_key_padding_mask=tin_mask,
+                return_attn=gal_weight > 0.0,
+            )
+
+            ce_logits, ctc_logits, returned_loss, attn = _unpack_model_outputs(outputs)
+
+            if returned_loss is not None:
+                ce_loss = returned_loss
+            else:
+                ce_loss = ce_criterion(
+                    ce_logits.reshape(-1, ce_logits.size(-1)),
+                    tgt_out.reshape(-1),
+                )
+
+            src_lens = (~src_mask).sum(dim=1).to(torch.long)
+            flat_tgt, flat_tgt_lens = _prepare_ctc_targets(
+                tgt=tgt,
+                tgt_lens=tgt_lens,
+                pad_id=model.pad_id,
+            )
+
+            if ctc_logits is not None and lambda_ctc > 0.0 and flat_tgt.numel() > 0:
+                log_probs = F.log_softmax(ctc_logits, dim=-1).transpose(0, 1)
+                input_lengths = src_lens.clamp(max=log_probs.size(0))
+                ctc_loss = ctc_criterion(
+                    log_probs,
+                    flat_tgt,
+                    input_lengths,
+                    flat_tgt_lens,
+                )
+            else:
+                ctc_loss = torch.zeros((), device=device, dtype=ce_loss.dtype)
+
+            loss = ce_loss + (lambda_ctc * ctc_loss)
+
+            if gal_weight > 0.0 and attn is not None:
                 # The decoder returns attention only from its last layer, so GAL
                 # is applied exclusively to the topmost decoder cross-attention.
-                _, ce_loss, attn = model(
-                    src=src,
-                    tgt_input=tgt_in,
-                    tgt_output=tgt_out,
-                    src_key_padding_mask=src_mask,
-                    tgt_in_key_padding_mask=tin_mask,
-                    return_attn=True,
-                )
-                src_lens = (~src_mask).sum(dim=1)
-                tgt_lens = (~tin_mask).sum(dim=1)
-                gal_loss = guided_attention_loss(attn, src_lens, tgt_lens, sigma=gal_sigma)
-                loss = ce_loss + gal_weight * gal_loss
+                tgt_lens_attn = (~tin_mask).sum(dim=1)
+                gal_loss = guided_attention_loss(attn, src_lens, tgt_lens_attn, sigma=gal_sigma)
+                loss = loss + gal_weight * gal_loss
             else:
-                _, ce_loss = model(
-                    src=src,
-                    tgt_input=tgt_in,
-                    tgt_output=tgt_out,
-                    src_key_padding_mask=src_mask,
-                    tgt_in_key_padding_mask=tin_mask,
-                )
                 gal_loss = torch.zeros((), device=device, dtype=ce_loss.dtype)
-                loss = ce_loss
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -223,6 +344,7 @@ def train_epoch(
         n_tok        = (tgt_out != model.pad_id).sum().item()
         total_loss  += loss.item() * n_tok
         total_ce_loss += ce_loss.item() * n_tok
+        total_ctc_loss += ctc_loss.item() * n_tok
         total_gal_loss += gal_loss.item() * n_tok
         total_tok   += n_tok
         total_steps += 1
@@ -240,12 +362,14 @@ def train_epoch(
 
     avg_loss = total_loss / max(1, total_tok)
     avg_ce_loss = total_ce_loss / max(1, total_tok)
+    avg_ctc_loss = total_ctc_loss / max(1, total_tok)
     avg_gal_loss = total_gal_loss / max(1, total_tok)
     ppl      = math.exp(min(avg_ce_loss, 20))
     elapsed  = time.time() - t0
     return {
         "loss": avg_loss,
         "ce_loss": avg_ce_loss,
+        "ctc_loss": avg_ctc_loss,
         "gal_loss": avg_gal_loss,
         "ppl": ppl,
         "steps": total_steps,
@@ -275,6 +399,7 @@ def validate(
     all_refs   = []
 
     amp_device = "cuda" if device.type == "cuda" else "cpu"
+    ce_criterion = nn.CrossEntropyLoss(ignore_index=model.pad_id)
 
     for batch in loader:
         src      = batch["src"].to(device, non_blocking=True)
@@ -284,13 +409,22 @@ def validate(
         tin_mask = batch["tgt_in_key_padding_mask"].to(device, non_blocking=True)
 
         with autocast(amp_device, enabled=use_amp):
-            _, loss = model(
+            outputs = model(
                 src=src,
                 tgt_input=tgt_in,
                 tgt_output=tgt_out,
                 src_key_padding_mask=src_mask,
                 tgt_in_key_padding_mask=tin_mask,
             )
+
+            ce_logits, _, returned_loss, _ = _unpack_model_outputs(outputs)
+            if returned_loss is not None:
+                loss = returned_loss
+            else:
+                loss = ce_criterion(
+                    ce_logits.reshape(-1, ce_logits.size(-1)),
+                    tgt_out.reshape(-1),
+                )
 
         n_tok       = (tgt_out != model.pad_id).sum().item()
         n_unk       = (tgt_out == tokenizer.unk_id).sum().item()
@@ -542,14 +676,14 @@ if __name__ == "__main__":
         "train_csv":     args.train_csv or "dataset/how2sign_realigned_train.csv",
         "val_csv":       args.val_csv or "dataset/how2sign_realigned_val.csv",
         "test_csv":      args.test_csv,
-        "train_landmarks_dir": "dataset/landmarks_normalized",
-        "val_landmarks_dir":   "dataset/landmarks_validation_normalized",
+        "train_landmarks_dir": "dataset/landmarks_face_reduced",
+        "val_landmarks_dir":   "dataset/landmarks_validation_face_reduced",
         "test_landmarks_dir":  None,
         "output_dir":    args.output_dir,
         "device":        "cuda",
         "use_amp":       True,
         # modello
-        "feat_dim":       2108,
+        "feat_dim":       572,
         "d_model":        512,
         "nhead":          8,
         "num_enc_layers": 6,

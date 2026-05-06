@@ -7,10 +7,12 @@ Defaults:
 """
 
 import argparse
+import csv
 import gc
 import json
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader
@@ -39,6 +41,22 @@ def compute_bleu(predictions: list[str], references: list[str]) -> float:
 
 def decode_batch(token_ids: list[list[int]], tokenizer: SentenceTokenizer) -> list[str]:
     return [tokenizer.decode(ids) for ids in token_ids]
+
+
+def _unpack_model_outputs(outputs):
+    if not isinstance(outputs, (tuple, list)):
+        return outputs, None, None, None
+
+    if len(outputs) >= 2 and torch.is_tensor(outputs[1]) and outputs[1].dim() == 0:
+        ce_logits = outputs[0]
+        ce_loss = outputs[1]
+        attn = outputs[2] if len(outputs) > 2 else None
+        return ce_logits, None, ce_loss, attn
+
+    ce_logits = outputs[0]
+    ctc_logits = outputs[1] if len(outputs) > 1 else None
+    attn = outputs[2] if len(outputs) > 2 else None
+    return ce_logits, ctc_logits, None, attn
 
 
 def _edit_distance(ref_words: list[str], hyp_words: list[str]) -> int:
@@ -151,22 +169,69 @@ def _resolve_checkpoint_path(cfg: dict) -> Path:
     checkpoint_value = cfg.get("checkpoint")
     output_dir = Path(cfg.get("output_dir") or "outputs/run2_optimized")
 
-    candidates = []
     if checkpoint_value:
-        candidates.append(Path(checkpoint_value))
-    candidates.extend([
-        output_dir / "best.pt",
-        output_dir / "last.pt",
-    ])
-
-    for candidate in candidates:
+        candidate = Path(checkpoint_value)
         if candidate.exists():
-            if checkpoint_value and candidate != Path(checkpoint_value):
-                print(f"[EVAL] Checkpoint not found at {checkpoint_value}, using {candidate} instead.")
             return candidate
+        raise FileNotFoundError(f"Checkpoint not found at {candidate}")
 
-    searched = ", ".join(str(path) for path in candidates)
-    raise FileNotFoundError(f"Checkpoint not found. Searched: {searched}")
+    best_candidate = output_dir / "best.pt"
+    if best_candidate.exists():
+        return best_candidate
+
+    raise FileNotFoundError(
+        f"Default checkpoint not found: {best_candidate}. "
+        "Pass --checkpoint explicitly if needed."
+    )
+
+
+def _compute_landmark_stats(train_csv: str | Path, train_landmarks_dir: str | Path) -> dict | None:
+    """Compute per-feature mean/std on train landmarks to match training preprocessing."""
+    train_csv = Path(train_csv)
+    train_landmarks_dir = Path(train_landmarks_dir)
+
+    if not train_csv.exists() or not train_landmarks_dir.exists():
+        return None
+
+    ssum = None
+    ssq = None
+    count = 0
+
+    with open(train_csv, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for row in reader:
+            sentence_name = row.get("SENTENCE_NAME", "").strip()
+            sentence_id = row.get("SENTENCE_ID", "").strip()
+            if not sentence_name or not sentence_id:
+                continue
+
+            npy_path = train_landmarks_dir / f"{sentence_id}_{sentence_name}_landmarks.npy"
+            if not npy_path.exists():
+                continue
+
+            try:
+                arr = np.load(npy_path, mmap_mode="r")
+                if arr.ndim == 3:
+                    arr = arr.reshape(arr.shape[0], -1)
+            except Exception:
+                continue
+
+            data = arr.astype(np.float64, copy=False)
+            if ssum is None:
+                ssum = data.sum(axis=0, dtype=np.float64)
+                ssq = (data ** 2).sum(axis=0, dtype=np.float64)
+            else:
+                ssum += data.sum(axis=0, dtype=np.float64)
+                ssq += (data ** 2).sum(axis=0, dtype=np.float64)
+            count += data.shape[0]
+
+    if count == 0 or ssum is None or ssq is None:
+        return None
+
+    mean = ssum / count
+    var = (ssq / count) - (mean ** 2)
+    std = np.sqrt(np.maximum(var, 1e-12))
+    return {"mean": mean.astype(np.float32), "std": std.astype(np.float32)}
 
 
 def _load_tokenizer(cfg: dict) -> SentenceTokenizer:
@@ -268,6 +333,16 @@ def evaluate(cfg: dict) -> dict:
     model_cfg = _resolve_model_cfg(cfg, ckpt_cfg)
     data_weights = _resolve_data_weights(cfg, ckpt_cfg)
 
+    train_csv = cfg.get("train_csv") or ckpt_cfg.get("train_csv")
+    train_landmarks_dir = cfg.get("train_landmarks_dir") or ckpt_cfg.get("train_landmarks_dir")
+    normalize_stats = None
+    if train_csv and train_landmarks_dir:
+        normalize_stats = _compute_landmark_stats(train_csv, train_landmarks_dir)
+        if normalize_stats is None:
+            print("[EVAL] Warning: could not compute train normalization stats; evaluating without them.")
+    else:
+        print("[EVAL] Warning: train_csv/train_landmarks_dir not available; evaluating without train normalization stats.")
+
     # Backward-compatible loading: older checkpoints may not store temporal CNN
     # hyperparameters in cfg, so infer them from checkpoint shapes.
     if model_cfg["src_embedding_type"] == "temporal_cnn":
@@ -286,7 +361,20 @@ def evaluate(cfg: dict) -> dict:
         pose_weight=data_weights["pose_weight"],
         hand_weight=data_weights["hand_weight"],
         face_weight=data_weights["face_weight"],
+        normalize_stats=normalize_stats,
     )
+    # Validate that dataset feature-dimension matches model configuration to
+    # avoid conv1d channel mismatches (common after switching landmark layouts).
+    ds_feat = getattr(dataset, "_dataset_feat_dim", None)
+    model_feat = int(model_cfg.get("feat_dim", 2108))
+    if ds_feat is not None and ds_feat != model_feat:
+        raise RuntimeError(
+            f"[EVAL] Feature-dim mismatch: dataset provides feat_dim={ds_feat} "
+            f"but model/checkpoint expects feat_dim={model_feat}.\n"
+            "Actions: either pass --landmarks_dir pointing to the reduced landmarks folder, "
+            "or convert your landmarks with scripts/reduce_face_landmarks.py, or run evaluation with "
+            "--feat_dim set to the dataset feature-dim to match your checkpoint."
+        )
     loader = DataLoader(
         dataset,
         batch_size=cfg["batch_size"],
@@ -315,7 +403,9 @@ def evaluate(cfg: dict) -> dict:
         label_smoothing=model_cfg["label_smoothing"],
     ).to(device)
 
-    model.load_state_dict(state_dict)
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    if missing_keys or unexpected_keys:
+        print(f"[EVAL] Warning: non-strict checkpoint load. Missing keys: {missing_keys}; unexpected keys: {unexpected_keys}")
     model.eval()
 
     total_loss = 0.0
@@ -334,13 +424,23 @@ def evaluate(cfg: dict) -> dict:
         tin_mask = batch["tgt_in_key_padding_mask"].to(device, non_blocking=True)
 
         with autocast(enabled=use_amp):
-            _, loss = model(
+            outputs = model(
                 src=src,
                 tgt_input=tgt_in,
                 tgt_output=tgt_out,
                 src_key_padding_mask=src_mask,
                 tgt_in_key_padding_mask=tin_mask,
             )
+
+            ce_logits, _, returned_loss, _ = _unpack_model_outputs(outputs)
+            if returned_loss is not None:
+                loss = returned_loss
+            else:
+                loss = torch.nn.functional.cross_entropy(
+                    ce_logits.reshape(-1, ce_logits.size(-1)),
+                    tgt_out.reshape(-1),
+                    ignore_index=model.pad_id,
+                )
 
         n_tok = (tgt_out != model.pad_id).sum().item()
         n_unk = (tgt_out == tokenizer.unk_id).sum().item()
@@ -408,7 +508,10 @@ def main():
         "--val_csv", type=str, default="dataset/how2sign_realigned_val.csv"
     )
     parser.add_argument(
-        "--landmarks_dir", type=str, default="dataset/landmarks_validation_normalized"
+        "--landmarks_dir", type=str, default="dataset/landmarks_validation_face_reduced"
+    )
+    parser.add_argument(
+        "--train_landmarks_dir", type=str, default="dataset/landmarks_face_reduced"
     )
     parser.add_argument("--batch_size", type=int, default=batch_size_default)
     parser.add_argument("--num_workers", type=int, default=4)
