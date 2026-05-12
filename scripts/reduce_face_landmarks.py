@@ -3,70 +3,54 @@
 Reduce MediaPipe face landmarks to selected subsets while keeping pose and hands.
 
 Output layout keeps the same file names and stores arrays as (T, N_selected, 4), where:
-N_selected = 17 pose + 21 left hand + 21 right hand + selected face points.
+N_selected = 17 pose + 21 left hand + 21 right hand + compressed face points.
 
-Also exports a diagnostic plot for one frame to visually verify selected indices.
+Face compression strategy:
+- mouth: explicitly sample 12 key points to perfectly preserve shape
+- left/right eye: sample every 2nd point to perfectly preserve the loop shape (8 points)
+- left/right eyebrow: calculate exact average between 3 upper/lower pairs to form a central line
+- nose tip: keep 1 point
 """
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 
+# -------------------------------------------------------------------------
+# EXPLICIT INDICES SELECTION
+# -------------------------------------------------------------------------
 
-def _ordered_unique(values: Iterable[int]) -> list[int]:
-    seen = set()
-    out = []
-    for v in values:
-        iv = int(v)
-        if iv not in seen:
-            seen.add(iv)
-            out.append(iv)
-    return out
-
-
-# FaceMesh local indices provided by user
-MOUTH_IDX = [
-    61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291,
-    78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308,
-    191, 80, 81, 82, 13, 312, 311, 310, 415,
+# Selezioniamo 12 punti chiave (8 esterni, 4 interni), ordinati in senso orario
+REDUCED_MOUTH_IDX = [
+    # Labbro Esterno (partendo da sinistra, senso orario)
+    61, 39, 0, 269, 291, 375, 17, 181,
+    # Labbro Interno (partendo da sinistra, senso orario)
+    78, 13, 308, 14
 ]
+
+# Per gli occhi, prendiamo un punto su due dall'anello originale di 16 punti (8 punti totali)
 LEFT_EYE_IDX = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
+REDUCED_LEFT_EYE_IDX = LEFT_EYE_IDX[::2]
+
 RIGHT_EYE_IDX = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
-LEFT_BROW_IDX = [70, 63, 105, 66, 107, 55, 65, 52, 53, 46]
-RIGHT_BROW_IDX = [300, 293, 334, 296, 336, 285, 295, 282, 283, 276]
-NOSE_TIP_IDX = [1]  # MediaPipe FaceMesh nose tip
+REDUCED_RIGHT_EYE_IDX = RIGHT_EYE_IDX[::2]
+
+NOSE_TIP_IDX = [1]
+
+# Per le sopracciglia, definiamo le COPPIE (superiore, inferiore)
+# da mediare per ottenere una linea centrale di 3 punti per lato.
+# Formato: (Interno, Centrale, Esterno)
+LEFT_BROW_PAIRS = [(107, 55), (105, 52), (70, 46)]
+RIGHT_BROW_PAIRS = [(336, 285), (334, 282), (300, 276)]
 
 POSE = 17
 LEFT_HAND = 21
 RIGHT_HAND = 21
 FACE_OFFSET = POSE + LEFT_HAND + RIGHT_HAND  # 59
 N_DIMS = 4
-
-
-def build_face_subset_indices() -> dict[str, list[int]]:
-    return {
-        "mouth": _ordered_unique(MOUTH_IDX),
-        "left_eye": _ordered_unique(LEFT_EYE_IDX),
-        "right_eye": _ordered_unique(RIGHT_EYE_IDX),
-        "left_brow": _ordered_unique(LEFT_BROW_IDX),
-        "right_brow": _ordered_unique(RIGHT_BROW_IDX),
-        "nose_tip": _ordered_unique(NOSE_TIP_IDX),
-    }
-
-
-def build_global_keep_indices(face_groups: dict[str, list[int]]) -> list[int]:
-    pose_and_hands = list(range(FACE_OFFSET))
-    face_local = []
-    for group in ("mouth", "left_eye", "right_eye", "left_brow", "right_brow", "nose_tip"):
-        face_local.extend(face_groups[group])
-    face_local = _ordered_unique(face_local)
-    face_global = [FACE_OFFSET + i for i in face_local]
-    return pose_and_hands + face_global
-
 
 def ensure_3d_landmarks(arr: np.ndarray) -> np.ndarray:
     if arr.ndim == 3:
@@ -81,17 +65,47 @@ def ensure_3d_landmarks(arr: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unsupported shape: {arr.shape}")
 
 
-def reduce_landmarks_array(arr: np.ndarray, keep_global: list[int]) -> np.ndarray:
+def average_pairs(lm: np.ndarray, pairs: list[tuple[int, int]]) -> np.ndarray:
+    """Calcola la media esatta per un elenco di coppie di indici per creare la linea centrale."""
+    pts = []
+    for p1, p2 in pairs:
+        pt = (lm[:, FACE_OFFSET + p1, :] + lm[:, FACE_OFFSET + p2, :]) / 2.0
+        pts.append(pt)
+    return np.stack(pts, axis=1)
+
+
+def reduce_landmarks_array(arr: np.ndarray) -> np.ndarray:
     lm = ensure_3d_landmarks(arr)
-    if lm.shape[1] < max(keep_global) + 1:
+
+    if lm.shape[1] <= FACE_OFFSET:
         raise ValueError(
-            f"Input has {lm.shape[1]} landmarks, but max required index is {max(keep_global)}"
+            f"Input has {lm.shape[1]} landmarks, but face landmarks start at index {FACE_OFFSET}"
         )
-    reduced = lm[:, keep_global, :]
+
+    pose_and_hands = lm[:, :FACE_OFFSET, :]
+    reduced_groups = [pose_and_hands]
+
+    # 1. Punti diretti (Bocca, Occhi, Naso)
+    direct_groups = [
+        REDUCED_MOUTH_IDX,
+        REDUCED_LEFT_EYE_IDX,
+        REDUCED_RIGHT_EYE_IDX,
+        NOSE_TIP_IDX
+    ]
+    for idx_list in direct_groups:
+        local_idx = np.asarray(idx_list, dtype=np.int64)
+        reduced_groups.append(lm[:, FACE_OFFSET + local_idx, :])
+
+    # 2. Punti mediati (Sopracciglia)
+    reduced_groups.append(average_pairs(lm, LEFT_BROW_PAIRS))
+    reduced_groups.append(average_pairs(lm, RIGHT_BROW_PAIRS))
+
+    # Concatena tutto lungo l'asse dei landmarks
+    reduced = np.concatenate(reduced_groups, axis=1)
     return reduced.astype(np.float32, copy=False)
 
 
-def process_directory(input_dir: Path, output_dir: Path, keep_global: list[int]) -> tuple[int, int]:
+def process_directory(input_dir: Path, output_dir: Path) -> tuple[int, int]:
     output_dir.mkdir(parents=True, exist_ok=True)
     npy_files = sorted(input_dir.glob("*_landmarks.npy"))
     ok = 0
@@ -101,7 +115,7 @@ def process_directory(input_dir: Path, output_dir: Path, keep_global: list[int])
         out_path = output_dir / npy_path.name
         try:
             arr = np.load(npy_path)
-            reduced = reduce_landmarks_array(arr, keep_global)
+            reduced = reduce_landmarks_array(arr)
             np.save(out_path, reduced)
             ok += 1
         except Exception as exc:
@@ -114,40 +128,45 @@ def process_directory(input_dir: Path, output_dir: Path, keep_global: list[int])
     return ok, skipped
 
 
-def plot_diagnostic_frame(
-    source_npy: Path,
-    keep_global: list[int],
-    face_groups: dict[str, list[int]],
-    out_png: Path,
-    frame_idx: int = 0,
-) -> None:
+def plot_diagnostic_frame(source_npy: Path, out_png: Path, frame_idx: int = 0) -> None:
     import matplotlib.pyplot as plt
 
+    # Carichiamo ed eseguiamo la riduzione sul frame di test per plottare direttamente il risultato
     arr = np.load(source_npy)
-    lm = ensure_3d_landmarks(arr)
-    frame_idx = max(0, min(frame_idx, lm.shape[0] - 1))
-    frame = lm[frame_idx]
-
-    face_all = frame[FACE_OFFSET:, :2]
-    selected_global = np.array(keep_global[FACE_OFFSET:], dtype=np.int64)
-    selected_face_local = selected_global - FACE_OFFSET
+    reduced_arr = reduce_landmarks_array(arr)
+    
+    frame_idx = max(0, min(frame_idx, reduced_arr.shape[0] - 1))
+    frame = reduced_arr[frame_idx]
 
     fig, ax = plt.subplots(figsize=(8, 8))
-    ax.scatter(face_all[:, 0], face_all[:, 1], s=8, c="#bdbdbd", alpha=0.45, label="face all")
 
-    colors = {
-        "mouth": "#e53935",
-        "left_eye": "#1e88e5",
-        "right_eye": "#1e88e5",
-        "left_brow": "#43a047",
-        "right_brow": "#43a047",
-        "nose_tip": "#fb8c00",
+    # Mappiamo gli offset del nuovo array ridotto per il plot
+    # L'array 'frame' ora contiene: [0:59 Pose/Mani] + [59:71 Bocca] + [71:79 Occhio Sx] + [79:87 Occhio Dx] + [87 Naso] + [88:91 Sopracciglia Sx] + [91:94 Sopracciglia Dx]
+    plot_sections = {
+        "mouth":      {"slice": slice(59, 71), "color": "#e53935"},
+        "left_eye":   {"slice": slice(71, 79), "color": "#1e88e5"},
+        "right_eye":  {"slice": slice(79, 87), "color": "#1e88e5"},
+        "nose_tip":   {"slice": slice(87, 88), "color": "#fb8c00"},
+        "left_brow":  {"slice": slice(88, 91), "color": "#43a047"},
+        "right_brow": {"slice": slice(91, 94), "color": "#43a047"},
     }
 
-    for group_name, local_idx in face_groups.items():
-        idx = np.array(local_idx, dtype=np.int64)
-        pts = frame[FACE_OFFSET + idx, :2]
-        ax.scatter(pts[:, 0], pts[:, 1], s=28, c=colors[group_name], label=group_name)
+    for group_name, info in plot_sections.items():
+        pts = frame[info["slice"], :]
+        
+        # Opzionale: per occhio e bocca chiudiamo il poligono visivo unendo l'ultimo punto al primo nel plot
+        if group_name in ["left_eye", "right_eye"]:
+            pts = np.concatenate([pts, pts[0:1]], axis=0)
+
+        ax.plot(
+            pts[:, 0],
+            pts[:, 1],
+            marker="o",
+            markersize=5,
+            linewidth=1.5 if group_name != "nose_tip" else 0,
+            c=info["color"],
+            label=group_name if group_name not in ["right_eye", "right_brow"] else None, # Evita duplicati in legenda
+        )
 
     ax.set_title("Reduced face landmarks diagnostic")
     ax.set_xlabel("x")
@@ -161,7 +180,6 @@ def plot_diagnostic_frame(
     plt.close(fig)
 
     print(f"[PLOT] Saved diagnostic plot: {out_png}")
-    print(f"[PLOT] Source file: {source_npy.name}, frame={frame_idx}, selected_face_points={len(selected_face_local)}")
 
 
 def main() -> None:
@@ -178,34 +196,32 @@ def main() -> None:
     if not in_dir.exists():
         raise FileNotFoundError(f"Input directory not found: {in_dir}")
 
-    face_groups = build_face_subset_indices()
-    keep_global = build_global_keep_indices(face_groups)
+    total_face_points = len(REDUCED_MOUTH_IDX) + len(REDUCED_LEFT_EYE_IDX) + len(REDUCED_RIGHT_EYE_IDX) + len(NOSE_TIP_IDX) + 6
+    total_landmarks = FACE_OFFSET + total_face_points
 
-    print("[INFO] Face groups counts:")
-    for k, v in face_groups.items():
-        print(f"  - {k}: {len(v)}")
-    print(f"[INFO] Total selected face points: {len(keep_global) - FACE_OFFSET}")
-    print(f"[INFO] New landmarks per frame: {len(keep_global)}")
-    print(f"[INFO] New feat_dim: {len(keep_global) * N_DIMS}")
+    print(f"[INFO] Total selected face points: {total_face_points}")
+    print(f"[INFO] New landmarks per frame: {total_landmarks} (59 body + {total_face_points} face)")
+    print(f"[INFO] New feat_dim: {total_landmarks * N_DIMS}")
 
-    ok, skipped = process_directory(in_dir, out_dir, keep_global)
+    ok, skipped = process_directory(in_dir, out_dir)
     print(f"[DONE] Converted files: {ok}, skipped: {skipped}")
 
     sample_npy = Path(args.sample_npy) if args.sample_npy else None
     if sample_npy is None:
         candidates = sorted(in_dir.glob("*_landmarks.npy"))
-        if not candidates:
-            raise RuntimeError(f"No landmark files found in {in_dir}")
-        sample_npy = candidates[0]
+        if candidates:
+            sample_npy = candidates[0]
 
-    plot_diagnostic_frame(
-        source_npy=sample_npy,
-        keep_global=keep_global,
-        face_groups=face_groups,
-        out_png=Path(args.plot_path),
-        frame_idx=args.frame_idx,
-    )
-
+    if sample_npy:
+        try:
+            plot_diagnostic_frame(
+                source_npy=sample_npy,
+                out_png=Path(args.plot_path),
+                frame_idx=args.frame_idx,
+            )
+        except ModuleNotFoundError as e:
+            print(f"[WARN] Skipping plot generation: {e}")
+            print(f"[INFO] Install matplotlib if you want diagnostic plots: pip install matplotlib")
 
 if __name__ == "__main__":
     main()

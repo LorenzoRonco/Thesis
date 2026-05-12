@@ -21,39 +21,6 @@ from torch import Tensor
 
 
 # ──────────────────────────────────────────────
-# Positional Encoding sinusoidale
-# ──────────────────────────────────────────────
-class SinusoidalPositionalEncoding(nn.Module):
-    """
-    PE classico di Vaswani et al. (2017).
-    Supporta sequenze fino a max_len frame/token.
-    """
-
-    def __init__(self, d_model: int, max_len: int = 4096, dropout: float = 0.1):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        pe = torch.zeros(max_len, d_model)                       # (L, D)
-        pos = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  # (L,1)
-        div = torch.exp(
-            torch.arange(0, d_model, 2, dtype=torch.float)
-            * (-math.log(10000.0) / d_model)
-        )
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        self.register_buffer("pe", pe.unsqueeze(0))             # (1, L, D)
-
-    def forward(self, x: Tensor) -> Tensor:
-        """x: (B, T, D)"""
-        if x.size(1) > self.pe.size(1):
-            raise ValueError(
-                f"Sequence length {x.size(1)} exceeds max positional length {self.pe.size(1)}"
-            )
-        x = x + self.pe[:, : x.size(1)]
-        return self.dropout(x)
-
-
-# ──────────────────────────────────────────────
 # Temporal CNN feature extractor (Conv1d)
 # ──────────────────────────────────────────────
 class TemporalConvBlock(nn.Module):
@@ -212,29 +179,43 @@ class LandmarkEmbedding(nn.Module):
 # ──────────────────────────────────────────────
 # Token Embedding per il decoder
 # ──────────────────────────────────────────────
+class SinusoidalPositionalEncoding(nn.Module):
+    """Standard sinusoidal positional encoding for autoregressive decoding."""
+
+    def __init__(self, d_model: int, max_len: int = 512, dropout: float = 0.1):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)  # (1, max_len, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: Tensor) -> Tensor:
+        if x.size(1) > self.pe.size(1):
+            raise ValueError(
+                f"Target sequence length {x.size(1)} exceeds max_len={self.pe.size(1)} for positional encoding"
+            )
+        x = x + self.pe[:, : x.size(1), :].to(x.dtype)
+        return self.dropout(x)
+
+
 class TokenEmbedding(nn.Module):
     def __init__(self, vocab_size: int, d_model: int, max_len: int = 512, dropout: float = 0.1):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.scale     = math.sqrt(d_model)
-        self.gru = nn.GRU(
-            input_size=d_model,
-            hidden_size=d_model,
-            num_layers=1,
-            batch_first=True,
-            bidirectional=False,
-        )
+        self.positional = SinusoidalPositionalEncoding(d_model=d_model, max_len=max_len, dropout=dropout)
 
     def forward(self, tgt: Tensor, tgt_key_padding_mask: Tensor | None = None) -> Tensor:
         """tgt: (B, L) → (B, L, d_model)"""
         x = self.embedding(tgt) * self.scale
+        x = self.positional(x)
+
         if tgt_key_padding_mask is not None:
-            lengths = (~tgt_key_padding_mask).sum(dim=1).clamp(min=1).to(torch.long).cpu()
-            packed = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
-            packed_out, _ = self.gru(packed)
-            x, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True, total_length=tgt.size(1))
-        else:
-            x, _ = self.gru(x)
+            x = x.masked_fill(tgt_key_padding_mask.unsqueeze(-1), 0.0)
+
         return x
 
 
@@ -496,7 +477,10 @@ class SignLanguageTransformer(nn.Module):
         )
 
         # ── CTC head ──────────────────────────
-        self.ctc_head = nn.Linear(d_model, vocab_size)
+        # CTC requires an extra blank symbol. We make the head emit
+        # (vocab_size + 1) classes and reserve the last index as the blank.
+        self.ctc_blank = vocab_size
+        self.ctc_head = nn.Linear(d_model, vocab_size + 1)
 
         # ── Decoder ───────────────────────────
         dec_layer = TransformerDecoderLayerWithAttn(
@@ -517,16 +501,13 @@ class SignLanguageTransformer(nn.Module):
         # ── Proiezione output ─────────────────
         self.output_proj = nn.Linear(d_model, vocab_size)
 
-        # ── Loss ──────────────────────────────
-        self.criterion = nn.CrossEntropyLoss(
-            ignore_index=pad_id,
-            label_smoothing=label_smoothing,
-        )
-
         self._init_weights()
 
     def _init_weights(self):
         for name, p in self.named_parameters():
+            # Keep PyTorch default init for GRU params (better suited for gated RNNs).
+            if "bigru" in name:
+                continue
             # Token embedding: initialize with normal std = d_model^-0.5 (common practice)
             if "tgt_embed.embedding.weight" in name:
                 nn.init.normal_(p, mean=0.0, std=self.d_model ** -0.5)
@@ -567,7 +548,7 @@ class SignLanguageTransformer(nn.Module):
         """
         Ritorna:
             ce_logits:  (B, L-1, vocab_size)
-            ctc_logits: (B, T, vocab_size)
+                ctc_logits: (B, T, vocab_size+1)  # includes blank as last index
             attn:       (B, L-1, T) se return_attn=True
         """
         B, T, _ = src.shape
@@ -576,7 +557,7 @@ class SignLanguageTransformer(nn.Module):
 
         # ── Encode ────────────────────────────
         memory = self.encode(src, src_key_padding_mask)   # (B, T, d_model)
-        ctc_logits = self.ctc_head(memory)                # (B, T, V)
+        ctc_logits = self.ctc_head(memory)                # (B, T, V+1) - last index is blank
 
         # ── Decode ────────────────────────────
         causal_mask = self._make_causal_mask(L, device)   # (L, L)
@@ -624,6 +605,21 @@ class SignLanguageTransformer(nn.Module):
                 print("[Model Debug] src_emb stats: mean={:.6f}, std={:.6f}".format(src_emb.mean().item(), src_emb.std().item()))
             except Exception:
                 pass
+
+        # Optional positional encoding debug: print info once when requested
+        if getattr(self, "debug_positional_encoding", False) and not getattr(self, "_logged_pos_enc_once", False):
+            try:
+                pe = None
+                if hasattr(self, "tgt_embed") and hasattr(self.tgt_embed, "positional") and hasattr(self.tgt_embed.positional, "pe"):
+                    pe = self.tgt_embed.positional.pe
+                if pe is not None:
+                    print(f"[Model Debug] Positional encoding buffer shape: {tuple(pe.shape)}  dtype={pe.dtype}  device={pe.device}")
+                    print(f"[Model Debug] PosEnc stats: mean={pe.mean().item():.6f}, std={pe.std().item():.6f}")
+                else:
+                    print("[Model Debug] Positional encoding buffer not found on model.tgt_embed.positional.pe")
+            except Exception:
+                pass
+            self._logged_pos_enc_once = True
 
         memory = self.encoder(
             src_emb,
@@ -746,8 +742,9 @@ class SignLanguageTransformer(nn.Module):
                 break
 
             # Mantieni i beam migliori (con length penalty)
+            # Use sequence length excluding <bos> for length penalty (off-by-one fix).
             candidates.sort(
-                key=lambda x: x[0] / (len(x[1]) ** length_penalty),
+                key=lambda x: x[0] / (max(1, (len(x[1]) - 1)) ** length_penalty),
                 reverse=True,
             )
             beams = candidates[:beam_size]
@@ -755,8 +752,9 @@ class SignLanguageTransformer(nn.Module):
         completed += [(s, seq) for s, seq in beams if seq[-1] != eos_id]
         if not completed:
             return []
+        # Final sort: use length excluding <bos> to compute length-penalty correctly.
         completed.sort(
-            key=lambda x: x[0] / (len(x[1]) ** length_penalty),
+            key=lambda x: x[0] / (max(1, (len(x[1]) - 1)) ** length_penalty),
             reverse=True,
         )
         best_seq = completed[0][1]

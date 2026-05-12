@@ -253,7 +253,13 @@ def train_epoch(
 
     amp_device = "cuda" if device.type == "cuda" else "cpu"
     ce_criterion = nn.CrossEntropyLoss(ignore_index=model.pad_id)
-    ctc_criterion = nn.CTCLoss(blank=ctc_blank, zero_infinity=True)
+    # Determine blank index for CTC: prefer model.ctc_blank if present (last class),
+    # otherwise fall back to function argument `ctc_blank`.
+    if hasattr(model, "ctc_blank"):
+        blank_idx = int(model.ctc_blank)
+    else:
+        blank_idx = int(ctc_blank)
+    ctc_criterion = nn.CTCLoss(blank=blank_idx, zero_infinity=True)
 
     last_log_time = time.time()
 
@@ -336,9 +342,13 @@ def train_epoch(
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+
+        old_scale = scaler.get_scale()
         scaler.step(optimizer)
         scaler.update()
-        if scheduler is not None:
+
+        # Advance the LR schedule only when an optimizer step actually happened.
+        if scheduler is not None and scaler.get_scale() >= old_scale:
             scheduler.step()
 
         n_tok        = (tgt_out != model.pad_id).sum().item()
@@ -490,7 +500,11 @@ def save_checkpoint(
 
 def load_checkpoint(path: Path, model, optimizer, scheduler, scaler, device):
     ckpt = torch.load(path, map_location=device)
-    model.load_state_dict(ckpt["model"])
+    missing_keys, unexpected_keys = model.load_state_dict(ckpt["model"], strict=False)
+    if missing_keys:
+        print(f"[load_checkpoint] Missing model keys ({len(missing_keys)}): {missing_keys}")
+    if unexpected_keys:
+        print(f"[load_checkpoint] Unexpected model keys ({len(unexpected_keys)}): {unexpected_keys}")
     optimizer.load_state_dict(ckpt["optimizer"])
     if scheduler and ckpt.get("scheduler"):
         scheduler.load_state_dict(ckpt["scheduler"])

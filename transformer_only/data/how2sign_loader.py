@@ -17,6 +17,7 @@ import os
 import csv
 import math
 import random
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -64,6 +65,8 @@ class SentenceTokenizer:
         self.token2idx: dict[str, int] = {}
         self.idx2token: dict[int, str] = {}
         self._build_specials()
+
+    _TOKEN_RE = re.compile(r"[a-z0-9]+(?:['-][a-z0-9]+)*|[^\w\s]")
 
     def _build_specials(self):
         for tok in [self.PAD_TOKEN, self.BOS_TOKEN, self.EOS_TOKEN, self.UNK_TOKEN]:
@@ -116,7 +119,7 @@ class SentenceTokenizer:
 
     @staticmethod
     def _split(sentence: str) -> list[str]:
-        return sentence.lower().split()
+        return SentenceTokenizer._TOKEN_RE.findall(sentence.lower())
 
     # ── encode / decode ───────────────────────
     def encode(self, sentence: str, add_special_tokens: bool = True) -> list[int]:
@@ -132,7 +135,22 @@ class SentenceTokenizer:
             if skip_special_tokens and i in specials:
                 continue
             tokens.append(self.idx2token.get(i, self.UNK_TOKEN))
-        return " ".join(tokens)
+        return self._detokenize(tokens)
+
+    @staticmethod
+    def _detokenize(tokens: list[str]) -> str:
+        closing_punct = {".", ",", "!", "?", ":", ";", "%", ")", "]", "}", "'", '"'}
+        hyphen_like = {"-", "–", "—"}
+        out: list[str] = []
+        for tok in tokens:
+            if not out:
+                out.append(tok)
+                continue
+            if tok in closing_punct or tok in hyphen_like:
+                out[-1] = out[-1] + tok
+            else:
+                out.append(tok)
+        return " ".join(out)
 
     # ── salvataggio / caricamento ─────────────
     def save(self, path: str | Path):
@@ -262,6 +280,9 @@ class How2SignDataset(Dataset):
         Keeps confidence channel unchanged.
         lm shape: (T, N_landmarks, 4)
         """
+        # Detach from potential NumPy-backed storage/views before slice updates.
+        lm = lm.clone()
+
         # Global indices in this project layout:
         # pose [0:17), left hand [17:38), right hand [38:59), face [59:527)
         left_start = POSE_LANDMARKS
@@ -271,8 +292,12 @@ class How2SignDataset(Dataset):
         left_wrist = lm[:, left_start:left_start + 1, :3]    # (T, 1, 3)
         right_wrist = lm[:, right_start:right_start + 1, :3] # (T, 1, 3)
 
-        lm[:, left_start:left_start + LEFT_HAND_LANDMARKS, :3] -= left_wrist
-        lm[:, right_start:right_start + RIGHT_HAND_LANDMARKS, :3] -= right_wrist
+        lm[:, left_start:left_start + LEFT_HAND_LANDMARKS, :3] = (
+            lm[:, left_start:left_start + LEFT_HAND_LANDMARKS, :3] - left_wrist
+        )
+        lm[:, right_start:right_start + RIGHT_HAND_LANDMARKS, :3] = (
+            lm[:, right_start:right_start + RIGHT_HAND_LANDMARKS, :3] - right_wrist
+        )
         return lm
 
     def _apply_hand_augmentation(self, lm: torch.Tensor) -> torch.Tensor:
@@ -394,11 +419,7 @@ class How2SignDataset(Dataset):
         if self.max_src_len and lm.shape[0] > self.max_src_len:
             lm = lm[: self.max_src_len]
 
-        # Hand-centric normalization (relative to wrist) to reduce absolute-position dominance.
-        if self.use_hand_relative_norm:
-            lm = self._apply_hand_relative_normalization(lm)
-
-        # Standardizzazione per-feature (se fornita)
+        # Standardizzazione per-feature (se fornita), usando stats stimate sui dati raw.
         if self._norm_mean is not None and self._norm_std is not None:
             # _norm_mean/std have shape (FEAT_DIM,) for flattened representation
             # Apply per-frame standardization
@@ -406,6 +427,10 @@ class How2SignDataset(Dataset):
             flat = lm.view(T, feat_dim).numpy()
             flat = (flat - self._norm_mean) / (self._norm_std + 1e-6)
             lm = torch.from_numpy(flat).float().view(T, n_landmarks, N_DIMS)
+
+        # Hand-centric normalization (relative to wrist) to reduce absolute-position dominance.
+        if self.use_hand_relative_norm:
+            lm = self._apply_hand_relative_normalization(lm)
 
         # Training-only hand augmentation (finger dropout + noise)
         lm = self._apply_hand_augmentation(lm)
@@ -728,13 +753,16 @@ def build_dataloaders(
             max_samples=max_samples,
             sample_seed=subset_seed,
         )
-        if use_bucketing and shuffle:
+        if use_bucketing:
+            # Apply bucketing for both train and validation. For training we
+            # typically shuffle batches; for validation we keep shuffle=False
+            # but still bucket by length to reduce padding and speed up eval.
             lengths = _compute_src_lengths(ds)
             batch_sampler = BucketingBatchSampler(
                 lengths=lengths,
                 batch_size=batch_size,
                 bucket_size=bucket_size,
-                shuffle=True,
+                shuffle=shuffle,
                 drop_last=drop_last,
                 seed=subset_seed,
             )
