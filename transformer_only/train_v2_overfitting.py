@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-Optimized training run with better hyperparameters.
+Overfitting test: train and validate on the same 50 samples.
 
-Key changes from previous run (run1):
-- Learning rate: 0.0001 → 0.001 (10x higher)
-- Batch size: 32 → 64 (larger, less noisy)
-- Label smoothing: 0.1 → 0.05 (reduce over-smoothing)
-- Hand weight: 1.3 → 2.0 (emphasize hands strongly)
-- Face weight: 0.7 → 0.5 (reduce face noise)
-- Warmup doubled to give model more stability
-- Output to outputs/run2
+This script is identical to train_v2_optimized.py but with:
+- train_max_samples: 50
+- val_max_samples: 50  
+- val_csv = train_csv (same data for both train and validation)
+- output to outputs/train_v2_overfitting
+
+Purpose: Test if the model can perfectly memorize 50 samples.
+If loss → 0 and BLEU → high on both train and val, the model architecture
+and training loop are working correctly. Poor performance indicates
+bugs in model or training code.
 """
 
 import os
 import sys
 import json
+import csv
 from pathlib import Path
 
 # Prevent Tkinter backend crashes in non-interactive training runs.
@@ -41,7 +44,7 @@ from transformer_only.attention_visualizer import debug_attention_on_batch
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Train SignLanguageTransformer with optimized hyperparameters")
+    parser = argparse.ArgumentParser(description="Overfitting test: train and validate on same 50 samples")
     parser.add_argument("--tokenizer_min_freq", type=int, default=None, help="Minimum word frequency to include in vocabulary (overrides config)")
     parser.add_argument("--epochs", type=int, default=None, help="Number of epochs (overrides config)")
     parser.add_argument("--lr", type=float, default=None, help="Learning rate (overrides config)")
@@ -49,13 +52,14 @@ def main():
     parser.add_argument("--dropout", type=float, default=None, help="Dropout rate (overrides config)")
     parser.add_argument("--target_word_dropout", type=float, default=None, help="Target word dropout probability (overrides config)")
     args = parser.parse_args()
+    
     # ─────── Configuration ─────────────────────────────────
     cfg = {
         "train_csv": "dataset/how2sign_realigned_train.csv",
-        "val_csv": "dataset/how2sign_realigned_val.csv",
+        "val_csv": "dataset/how2sign_realigned_train.csv",  # SAME as train for overfitting test
         "train_landmarks_dir": "dataset/landmarks_face_reduced",
-        "val_landmarks_dir": "dataset/landmarks_validation_face_reduced",
-        "output_dir": "outputs/run2_optimized",
+        "val_landmarks_dir": "dataset/landmarks_face_reduced",  # SAME as train
+        "output_dir": "outputs/train_v2_overfitting",
         "device": "cuda",
         "use_amp": True,
         
@@ -66,7 +70,7 @@ def main():
         "num_enc_layers": 3,
         "num_dec_layers": 3,
         "dim_feedforward": 1024,
-        "dropout": 0.3,
+        "dropout": 0.0,
         "label_smoothing": 0.05,  # REDUCED from 0.1
         "max_src_len": 256,
         "max_tgt_len": 128,
@@ -74,12 +78,12 @@ def main():
         "src_embedding_type": "temporal_cnn",
         
         # Training - OPTIMIZED
-        "epochs": 100,
+        "epochs": 200,
         "batch_size": 32,  # Reduced from 64 due to GPU memory (10.57GB GPU)
-        "lr": 0.0005, 
+        "lr": 0.001, 
         "weight_decay": 1e-4,
         "clip_norm": 1.0,
-        "warmup_steps": 8000,  
+        "warmup_steps": 500,  
         "num_workers": 4,
         
         # Data weighting - OPTIMIZED
@@ -89,25 +93,25 @@ def main():
 
         # Hand-focused normalization + augmentation (anti-sink)
         "use_hand_relative_norm": True,
-        "thumb_dropout_prob": 0.20,
-        "hand_landmark_dropout_prob": 0.03,
-        "hand_noise_std": 0.015,
+        "thumb_dropout_prob": 0.0,
+        "hand_landmark_dropout_prob": 0.0,
+        "hand_noise_std": 0.0,
         # Decoder word dropout (replace with <unk> during training)
-        "target_word_dropout": 0.15,
+        "target_word_dropout": 0.0,
         # Tokenizer minimum frequency (words appearing < min_freq times are mapped to <unk>)
         "tokenizer_min_freq": 5,
         # Guided Attention Loss
-        "gal_weight": 10.0,
+        "gal_weight": 0.0,
         "gal_sigma": 0.25,
         # Joint CTC-Attention auxiliary loss
-        "lambda_ctc": 0.3,
+        "lambda_ctc": 0.0,
         
-        # Data sampling
+        # Data sampling - OVERFITTING TEST: use same 50 samples for train and val
         "train_subset_fraction": None,
         "val_subset_fraction": None,
-        "train_max_samples": None,
-        "val_max_samples": None,
-        "subset_seed": 42,
+        "train_max_samples": None,  # Will be set to None after CSV creation
+        "val_max_samples": None,     # Will be set to None after CSV creation
+        "subset_seed": 42,         # Seed for selecting the fixed 50 samples
 
         # Bucketing (riduce padding)
         "use_bucketing": True,
@@ -116,13 +120,13 @@ def main():
         
         # Logging
         "log_interval": 50,
-        "val_interval_early": 10,  # Validate every N epochs for first 20 epochs
-        "val_interval_late": 5,  # Validate every N epochs after epoch 20
+        "val_interval_early": 1,   # Validate every epoch during overfitting test
+        "val_interval_late": 1,    # Validate every epoch
         "early_phase_epochs": 20,  # Threshold between early and late phases
         "use_wandb": False,
         "debug_print_batch": False,
         "debug_max_items": 4,
-        "debug_attention": True,  # Visualizza i pesi di cross-attention
+        "debug_attention": False,  # Disable attention visualization for this test
         "debug_attention_interval": 10,  # Ogni N epoch
     }
     
@@ -143,24 +147,60 @@ def main():
     # Log CLI overrides
     cli_overrides = {k: v for k, v in vars(args).items() if v is not None}
     if cli_overrides:
-        print(f"[RUN2] CLI overrides: {cli_overrides}")
+        print(f"[OVERFITTING] CLI overrides: {cli_overrides}")
     
     # Create output directory
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[RUN2] Output directory: {output_dir}")
+    print(f"[OVERFITTING] Output directory: {output_dir}")
+    
+    # ─────── Create fixed 50-sample CSV ───────────────────────
+    print(f"[OVERFITTING] Creating fixed 50-sample CSV from {cfg['train_csv']}...")
+    
+    # Read the training CSV
+    with open(cfg["train_csv"], "r") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        all_rows = list(reader)
+    
+    print(f"[OVERFITTING] Total samples in CSV: {len(all_rows)}")
+    
+    # Select exactly 50 samples with fixed seed
+    np.random.seed(42)
+    selected_indices = np.random.choice(len(all_rows), size=min(50, len(all_rows)), replace=False)
+    selected_indices = sorted(selected_indices)  # Keep in order for reproducibility
+    selected_rows = [all_rows[i] for i in selected_indices]
+    
+    print(f"[OVERFITTING] Selected indices: {list(selected_indices)}")
+    print(f"[OVERFITTING] Number of selected samples: {len(selected_rows)}")
+    
+    # Create temporary CSV with only these 50 samples
+    temp_csv = output_dir / "overfitting_50samples.csv"
+    with open(temp_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(selected_rows)
+    
+    print(f"[OVERFITTING] Temporary CSV created: {temp_csv}")
+    
+    # Update config to use the temporary CSV for both train and val
+    cfg["train_csv"] = str(temp_csv)
+    cfg["val_csv"] = str(temp_csv)
+    cfg["train_max_samples"] = None  # No need to subsample further
+    cfg["val_max_samples"] = None
     
     # Save config
     config_path = output_dir / "config.json"
     with open(config_path, "w") as f:
         json.dump(cfg, f, indent=2)
-    print(f"[RUN2] Config saved to {config_path}")
+    print(f"[OVERFITTING] Config saved to {config_path}")
+    print()
     
     device = torch.device(cfg["device"] if torch.cuda.is_available() else "cpu")
-    print(f"[RUN2] Device: {device}")
+    print(f"[OVERFITTING] Device: {device}")
     
     # ─────── Build data ────────────────────────────────────
-    print("[RUN2] Building tokenizer and dataloaders...")
+    print("[OVERFITTING] Building tokenizer and dataloaders...")
     tok_path = output_dir / "tokenizer.json"
     tokenizer = build_tokenizer(
         cfg["train_csv"],
@@ -197,11 +237,13 @@ def main():
     )
     train_loader = loaders["train"]
     val_loader = loaders["val"]
-    print(f"[RUN2] Train loader: {len(train_loader)} batches")
-    print(f"[RUN2] Val loader: {len(val_loader)} batches")
+    print(f"[OVERFITTING] Train loader: {len(train_loader)} batches (50 fixed samples)")
+    print(f"[OVERFITTING] Val loader: {len(val_loader)} batches (same 50 fixed samples)")
+    print(f"[OVERFITTING] Train and Val use identical data from: {temp_csv}")
+    print()
     
     # ─────── Data quality check: zero frames ─────────────────
-    print("[RUN2] Checking for zero frames in first 100 training samples...")
+    print("[OVERFITTING] Checking for zero frames in training samples...")
     zero_frames = 0
     total_frames = 0
     for sample in train_loader.dataset.samples:
@@ -209,7 +251,7 @@ def main():
         zero_frames += (lm == 0).all(axis=-1).sum()
         total_frames += lm.shape[0]
     zero_pct = 100.0 * zero_frames / max(1, total_frames)
-    print(f"[RUN2] Completely zero frames: {zero_frames}/{total_frames} ({zero_pct:.2f}%)")
+    print(f"[OVERFITTING] Completely zero frames: {zero_frames}/{total_frames} ({zero_pct:.2f}%)")
     print()
 
     if cfg["debug_print_batch"]:
@@ -221,7 +263,7 @@ def main():
         src_lens = debug_batch.get("src_lens")
         tgt_lens = debug_batch.get("tgt_lens")
         max_items = min(cfg["debug_max_items"], len(sentences))
-        print("[RUN2] Debug batch (first items):")
+        print("[OVERFITTING] Debug batch (first items):")
         for i in range(max_items):
             name = names[i] if i < len(names) else "<missing>"
             sent_id = sent_ids[i] if i < len(sent_ids) else "<missing>"
@@ -234,7 +276,7 @@ def main():
             print(f"       tgt=\"{sent}\"")
     
     # ─────── Build model ──────────────────────────────────
-    print("[RUN2] Building model...")
+    print("[OVERFITTING] Building model...")
     model = SignLanguageTransformer(
         feat_dim=cfg["feat_dim"],
         vocab_size=tokenizer.vocab_size,
@@ -255,11 +297,10 @@ def main():
     model.to(device)
     # Enable model-level diagnostic stats logging if requested
     model.debug_log_stats = cfg.get("debug_print_batch", False)
-    model.debug_positional_encoding = True
     
     # Count parameters
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"[RUN2] Model parameters: {n_params:,}")
+    print(f"[OVERFITTING] Model parameters: {n_params:,}")
     
     # ─────── Optimizer & Scheduler ────────────────────────
     optimizer = AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
@@ -276,11 +317,16 @@ def main():
     best_bleu = 0.0
     best_epoch = 0
     
-    print("[RUN2] Starting training...")
-    print(f"[RUN2] Epochs: {cfg['epochs']}, Learning rate: {cfg['lr']}, Batch size: {cfg['batch_size']}")
-    print(f"[RUN2] Hand weight: {cfg['hand_weight']}, Face weight: {cfg['face_weight']}")
-    print(f"[RUN2] Warmup: {cfg['warmup_steps']} steps, Label smoothing: {cfg['label_smoothing']}")
-    print(f"[RUN2] max_src_len: {cfg['max_src_len']}, bucketing: {cfg['use_bucketing']} (bucket_size={cfg['bucket_size']})")
+    print("[OVERFITTING] Starting overfitting test...")
+    print(f"[OVERFITTING] Using fixed 50 samples from {temp_csv}")
+    print(f"[OVERFITTING] Epochs: {cfg['epochs']}, Learning rate: {cfg['lr']}, Batch size: {cfg['batch_size']}")
+    print(f"[OVERFITTING] GUARANTEED SAME DATA: train and val use IDENTICAL 50 samples")
+    print(f"[OVERFITTING] Expected behavior:")
+    print(f"[OVERFITTING]   - Loss should → 0 (model memorizes 50 samples)")
+    print(f"[OVERFITTING]   - Train BLEU should → high (~0.8+)")
+    print(f"[OVERFITTING]   - Val BLEU should also → high (same exact samples)")
+    print(f"[OVERFITTING]   - Train and Val curves should almost overlap (same data)")
+    print(f"[OVERFITTING]   - If loss doesn't decrease: bug in model/training!")
     print("")
     
     for epoch in range(1, cfg["epochs"] + 1):
@@ -300,63 +346,43 @@ def main():
             lambda_ctc=cfg.get("lambda_ctc", 0.3),
         )
         
-        # Determine validation interval based on phase
-        val_interval = (
-            cfg["val_interval_early"] 
-            if epoch <= cfg["early_phase_epochs"] 
-            else cfg["val_interval_late"]
+        # Always validate (every epoch) for overfitting test
+        val_stats = validate(
+            model=model,
+            loader=val_loader,
+            tokenizer=tokenizer,
+            device=device,
+            use_amp=cfg["use_amp"],
         )
         
-        # Validate
-        if epoch % val_interval == 0:
-            val_stats = validate(
-                model=model,
-                loader=val_loader,
-                tokenizer=tokenizer,
-                device=device,
-                use_amp=cfg["use_amp"],
-            )
+        val_bleu = val_stats.get("bleu", 0.0)
+        
+        # Log epoch
+        log_str = (
+            f"[E{epoch:3d}] "
+            f"train_loss={train_stats['loss']:.4f} "
+            f"train_ppl={train_stats['ppl']:.2f} | "
+            f"val_loss={val_stats['loss']:.4f} "
+            f"val_ppl={val_stats['ppl']:.2f} "
+            f"val_bleu={val_bleu:.4f}"
+        )
+        print(log_str)
+        
+        # Save if best
+        if val_bleu > best_bleu:
+            best_bleu = val_bleu
+            best_epoch = epoch
             
-            val_bleu = val_stats.get("bleu", 0.0)
-            
-            # Log epoch
-            log_str = (
-                f"[E{epoch:3d}] "
-                f"train_loss={train_stats['loss']:.4f} "
-                f"train_ppl={train_stats['ppl']:.2f} | "
-                f"val_loss={val_stats['loss']:.4f} "
-                f"val_ppl={val_stats['ppl']:.2f} "
-                f"val_bleu={val_bleu:.4f}"
-            )
-            print(log_str)
-            
-            # Debug attention weights
-            if cfg["debug_attention"] and (epoch % cfg["debug_attention_interval"] == 0):
-                print(f"  [DEBUG] Analyzing cross-attention weights...")
-                debug_batch = next(iter(val_loader))
-                debug_attention_on_batch(
-                    model, debug_batch, tokenizer, device,
-                    output_dir=output_dir / "attention_heatmaps"
-                )
-            
-            # Save if best
-            if val_bleu > best_bleu:
-                best_bleu = val_bleu
-                best_epoch = epoch
-                
-                ckpt_path = output_dir / "best.pt"
-                torch.save({
-                    "epoch": epoch,
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                    "scaler": scaler.state_dict(),
-                    "best_bleu": best_bleu,
-                    "cfg": cfg,
-                }, ckpt_path)
-                print(f"  ✓ New best! Saved to {ckpt_path}")
-        else:
-            print(f"[E{epoch:3d}] train_loss={train_stats['loss']:.4f} train_ppl={train_stats['ppl']:.2f}")
+            ckpt_path = output_dir / "best.pt"
+            torch.save({
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict(),
+                "best_bleu": best_bleu,
+                "cfg": cfg,
+            }, ckpt_path)
     
     # Final save
     last_path = output_dir / "last.pt"
@@ -370,11 +396,36 @@ def main():
         "cfg": cfg,
     }, last_path)
     
+    # ─────── Greedy decode on training samples ────────────
     print("")
-    print(f"[RUN2] Training complete!")
-    print(f"[RUN2] Best BLEU: {best_bleu:.4f} at epoch {best_epoch}")
-    print(f"[RUN2] Final checkpoint: {last_path}")
-
+    print("[OVERFITTING] Greedy decode on 50 training samples:")
+    print("")
+    model.eval()
+    with torch.no_grad():
+        for batch in train_loader:
+            src = batch["src"].to(device)
+            mask = batch["src_key_padding_mask"].to(device)
+            preds = model.greedy_decode(src, tokenizer.bos_id, tokenizer.eos_id, 
+                                         max_len=64, src_key_padding_mask=mask)
+            for i, (pred, ref) in enumerate(zip(preds, batch["sentences"])):
+                print(f"REF: {ref}")
+                print(f"HYP: {tokenizer.decode(pred)}")
+                print()
+            break
+    
+    print("")
+    print(f"[OVERFITTING] Overfitting test complete!")
+    print(f"[OVERFITTING] Best BLEU: {best_bleu:.4f} at epoch {best_epoch}")
+    print(f"[OVERFITTING] Final checkpoint: {last_path}")
+    
+    # Sanity check results
+    print("")
+    print("[OVERFITTING] RESULTS ANALYSIS:")
+    if best_bleu > 0.7:
+        print(f"  ✓ PASS: BLEU {best_bleu:.4f} is high - model can memorize")
+    else:
+        print(f"  ✗ WARNING: BLEU {best_bleu:.4f} is low - check for bugs!")
+    
 
 if __name__ == "__main__":
     main()
