@@ -116,33 +116,18 @@ class LandmarkEmbedding(nn.Module):
         temporal_blocks: int = 3,
     ):
         super().__init__()
-        if d_model % 2 != 0:
-            raise ValueError("d_model must be even to use a bidirectional GRU with hidden_size=d_model//2")
-        hidden_dim = hidden_dim or d_model * 2
-        self.silt_weights = nn.Parameter(torch.ones(1, d_model))
-        self.bigru = nn.GRU(
-            input_size=d_model,
-            hidden_size=d_model // 2,
-            num_layers=1,
-            batch_first=True,
-            bidirectional=True,
-        )
-
         self.d_model = d_model
         self.embedding_type = embedding_type
         self.proj = None
         self.temporal_extractor = None
-
-        if self.embedding_type == "mlp":
-            # Original embedding path (per-frame projection).
+        if embedding_type == "mlp":
             self.proj = nn.Sequential(
                 nn.Linear(feat_dim, hidden_dim),
                 nn.GELU(),
                 nn.LayerNorm(hidden_dim),
                 nn.Linear(hidden_dim, d_model),
             )
-        elif self.embedding_type == "temporal_cnn":
-            # Temporal feature extraction before positional encoding to reduce frame shortcut learning.
+        elif embedding_type == "temporal_cnn":
             self.temporal_extractor = TemporalConvFeatureExtractor(
                 input_dim=feat_dim,
                 d_model=d_model,
@@ -151,29 +136,26 @@ class LandmarkEmbedding(nn.Module):
                 kernel_size=temporal_kernel_size,
                 dropout=dropout,
             )
-        else:
-            raise ValueError(
-                f"Unknown embedding_type '{self.embedding_type}'. Supported: 'mlp', 'temporal_cnn'"
-            )
+    
+        # PE sinusoidale esplicito, uguale a quello del decoder
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe.unsqueeze(0))
+        
+        self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, src: Tensor, src_key_padding_mask: Tensor | None = None) -> Tensor:
-        """src: (B, T, feat_dim) → (B, T, d_model)"""
         if self.embedding_type == "mlp":
             x = self.proj(src)
         else:
             x = self.temporal_extractor(src)
-        x = x * self.silt_weights
-
-        if src_key_padding_mask is not None:
-            lengths = (~src_key_padding_mask).sum(dim=1).clamp(min=1).to(torch.long).cpu()
-            packed = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
-            packed_out, _ = self.bigru(packed)
-            x, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True, total_length=src.size(1))
-        else:
-            x, _ = self.bigru(x)
-
-        return self.norm(x)
+    
+        x = x + self.pe[:, :src.size(1)]
+        return self.norm(self.dropout(x))
 
 
 # ──────────────────────────────────────────────

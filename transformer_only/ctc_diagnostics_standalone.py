@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
-Standalone CTC Diagnostics Script
+Standalone CTC diagnostics script for PHOENIX-2014-T checkpoints produced by train.py.
 
 Esegui questo script per diagnosticare l'Encoder senza modificare il training loop:
 
     python transformer_only/ctc_diagnostics_standalone.py \\
-        --checkpoint outputs/run2_optimized/best.pt \\
-        --val_csv dataset/how2sign_realigned_val.csv
+        --checkpoint outputs/phoenix_run1/best.pt \\
+        --config outputs/phoenix_run1/config.json \\
+        --tokenizer_path outputs/phoenix_run1/tokenizer.json \\
+        --val_csv dataset/PHOENIX-2014-T.dev.corpus.csv \\
+        --landmarks_dir dataset/landmarks_dev
 
 Questo script:
-1. Carica il checkpoint
+1. Carica il checkpoint PHOENIX
 2. Esegue il forward pass su dati di validazione
 3. Decodifica CTC greedy (Encoder)
 4. Decodifica greedy Decoder
@@ -29,13 +32,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from transformer_only.data.how2sign_loader import (
-    How2SignDataset,
+from transformer_only.data.phoenix_loader import (
+    PhoenixDataset,
     SentenceTokenizer,
     collate_fn,
 )
 from transformer_only.models import SignLanguageTransformer
 from transformer_only.ctc_decode import decode_ctc_predictions, decode_ctc_batch_diagnostics
+from transformer_only.evaluate import _compute_landmark_stats
 
 
 def _unpack_model_outputs(outputs):
@@ -86,31 +90,43 @@ def main():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="outputs/run2_optimized/best.pt",
+        default="outputs/phoenix_run1/best.pt",
         help="Path to model checkpoint",
     )
     parser.add_argument(
         "--config",
         type=str,
-        default="outputs/run2_optimized/config.json",
+        default="outputs/phoenix_run1/config.json",
         help="Path to config.json from training",
     )
     parser.add_argument(
         "--val_csv",
         type=str,
-        default="dataset/how2sign_realigned_val.csv",
+        default="dataset/PHOENIX-2014-T.dev.corpus.csv",
         help="Validation CSV path",
     )
     parser.add_argument(
         "--landmarks_dir",
         type=str,
-        default="dataset/landmarks_validation_face_reduced",
+        default="dataset/landmarks_dev",
         help="Validation landmarks directory",
+    )
+    parser.add_argument(
+        "--train_csv",
+        type=str,
+        default="dataset/PHOENIX-2014-T.train.corpus.csv",
+        help="Training CSV path (used only for normalization stats)",
+    )
+    parser.add_argument(
+        "--train_landmarks_dir",
+        type=str,
+        default="dataset/landmarks_train",
+        help="Training landmarks directory (used only for normalization stats)",
     )
     parser.add_argument(
         "--tokenizer_path",
         type=str,
-        default="outputs/run2_optimized/tokenizer.json",
+        default="outputs/phoenix_run1/tokenizer.json",
         help="Path to tokenizer.json",
     )
     parser.add_argument(
@@ -128,7 +144,7 @@ def main():
     parser.add_argument(
         "--max_examples",
         type=int,
-        default=10,
+        default=5,
         help="Maximum number of examples to print",
     )
     parser.add_argument(
@@ -141,6 +157,13 @@ def main():
         "--use_amp",
         action="store_true",
         help="Use automatic mixed precision",
+    )
+    parser.add_argument(
+        "--target_field",
+        type=str,
+        default=None,
+        choices=["translation", "orth"],
+        help="Target field to evaluate (defaults to the checkpoint cfg)",
     )
 
     args = parser.parse_args()
@@ -177,7 +200,7 @@ def main():
 
     ckpt_cfg = ckpt.get("cfg", {}) if isinstance(ckpt, dict) else {}
     model_cfg = {
-        "feat_dim": cfg.get("feat_dim", ckpt_cfg.get("feat_dim", 2108)),
+        "feat_dim": cfg.get("feat_dim", ckpt_cfg.get("feat_dim", 376)),
         "d_model": cfg.get("d_model", ckpt_cfg.get("d_model", 512)),
         "nhead": cfg.get("nhead", ckpt_cfg.get("nhead", 8)),
         "num_enc_layers": cfg.get("num_enc_layers", ckpt_cfg.get("num_enc_layers", 3)),
@@ -186,8 +209,8 @@ def main():
         "dropout": cfg.get("dropout", ckpt_cfg.get("dropout", 0.1)),
         "max_src_len": cfg.get("max_src_len", ckpt_cfg.get("max_src_len", 256)),
         "max_tgt_len": cfg.get("max_tgt_len", ckpt_cfg.get("max_tgt_len", 128)),
-        "src_embedding_type": cfg.get("src_embedding_type", ckpt_cfg.get("src_embedding_type", "mlp")),
-        "label_smoothing": cfg.get("label_smoothing", ckpt_cfg.get("label_smoothing", 0.05)),
+        "src_embedding_type": cfg.get("src_embedding_type", ckpt_cfg.get("src_embedding_type", "temporal_cnn")),
+        "label_smoothing": cfg.get("label_smoothing", ckpt_cfg.get("label_smoothing", 0.1)),
         "temporal_kernel_size": cfg.get("temporal_kernel_size", ckpt_cfg.get("temporal_kernel_size")),
         "temporal_blocks": cfg.get("temporal_blocks", ckpt_cfg.get("temporal_blocks")),
     }
@@ -248,15 +271,28 @@ def main():
     # ═══════════════════════════════════════════════════════════
     # BUILD DATASET & DATALOADER
     # ═══════════════════════════════════════════════════════════
-    dataset = How2SignDataset(
+    target_field = args.target_field or cfg.get("target_field") or ckpt_cfg.get("target_field", "orth")
+
+    normalize_stats = None
+    if args.train_csv and args.train_landmarks_dir:
+        print("[CTC_DIAG] Calcolo stats normalizzazione dal training set...")
+        normalize_stats = _compute_landmark_stats(args.train_csv, args.train_landmarks_dir)
+        if normalize_stats is None:
+            print("[CTC_DIAG] Warning: impossibile calcolare le stats; si procede senza.")
+
+    dataset = PhoenixDataset(
         csv_path=args.val_csv,
         landmarks_dir=args.landmarks_dir,
         tokenizer=tokenizer,
-        max_src_len=cfg.get("max_src_len", 256),
-        max_tgt_len=cfg.get("max_tgt_len", 128),
-        pose_weight=cfg.get("pose_weight", 1.0),
-        hand_weight=cfg.get("hand_weight", 1.0),
-        face_weight=cfg.get("face_weight", 1.0),
+        target_field=target_field,
+        max_src_len=model_cfg["max_src_len"],
+        max_tgt_len=model_cfg["max_tgt_len"],
+        flatten_landmarks=True,
+        pose_weight=cfg.get("pose_weight", ckpt_cfg.get("pose_weight", 1.0)),
+        hand_weight=cfg.get("hand_weight", ckpt_cfg.get("hand_weight", 1.5)),
+        face_weight=cfg.get("face_weight", ckpt_cfg.get("face_weight", 0.8)),
+        normalize_stats=normalize_stats,
+        use_hand_relative_norm=ckpt_cfg.get("use_hand_relative_norm", True),
     )
 
     # Validate feature-dim consistency between dataset and model to avoid
@@ -267,7 +303,7 @@ def main():
         raise RuntimeError(
             f"[CTC_DIAG] Feature-dim mismatch: dataset provides feat_dim={ds_feat} "
             f"but model/checkpoint expects feat_dim={model_feat}.\n"
-            "Pass --landmarks_dir pointing to the reduced landmarks folder, or run the script with --config pointing to a config where feat_dim matches your landmarks."
+            "Pass --landmarks_dir pointing to the correct landmarks folder, or use a config that matches your checkpoint."
         )
 
     loader = DataLoader(
@@ -275,11 +311,17 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        collate_fn=lambda b: collate_fn(b, pad_id=tokenizer.pad_id),
-        pin_memory=True,
+        collate_fn=lambda b: collate_fn(
+            b,
+            pad_id=tokenizer.pad_id,
+            bos_id=tokenizer.bos_id,
+            unk_id=tokenizer.unk_id,
+            eos_id=tokenizer.eos_id,
+        ),
+        pin_memory=(device.type == "cuda"),
     )
 
-    print(f"[CTC_DIAG] Validation dataset: {len(dataset)} samples")
+    print(f"[CTC_DIAG] Validation dataset: {len(dataset)} samples (target='{target_field}')")
     print(f"[CTC_DIAG] DataLoader: {len(loader)} batches")
 
     # ═══════════════════════════════════════════════════════════
@@ -291,8 +333,9 @@ def main():
     all_ctc_stats = []
 
     with torch.no_grad():
+        collected_examples = 0
         for batch_idx, batch in enumerate(loader):
-            if batch_idx >= 2:  # Limit to first 2 batches for speed
+            if collected_examples >= args.max_examples:
                 break
 
             src = batch["src"].to(device, non_blocking=True)
@@ -302,7 +345,7 @@ def main():
             tin_mask = batch["tgt_in_key_padding_mask"].to(device, non_blocking=True)
 
             # Forward pass
-            with torch.amp.autocast("cuda", enabled=args.use_amp):
+            with torch.amp.autocast(device_type=device.type, enabled=args.use_amp and device.type == "cuda"):
                 outputs = model(
                     src=src,
                     tgt_input=tgt_in,
@@ -323,18 +366,20 @@ def main():
                 ctc_decoded = decode_ctc_predictions(
                     ctc_logits,
                     idx2token,
-                    blank_idx=tokenizer.pad_id,
+                    blank_idx=ctc_logits.size(-1) - 1,
                     pad_idx=tokenizer.pad_id,
                 )
                 all_ctc_decoded.extend(ctc_decoded)
 
                 # Statistiche
+                # Limit per-batch diagnostics to remaining examples requested
+                per_batch_max = max(1, min(args.max_examples - collected_examples, ctc_logits.size(0)))
                 ctc_diag = decode_ctc_batch_diagnostics(
                     ctc_logits,
                     idx2token,
                     tokenizer,
-                    max_examples=3,
-                    blank_idx=tokenizer.pad_id,
+                    max_examples=per_batch_max,
+                    blank_idx=ctc_logits.size(-1) - 1,
                     pad_idx=tokenizer.pad_id,
                 )
                 print(f"\n[Batch {batch_idx}] CTC Stats:")
@@ -359,7 +404,17 @@ def main():
             all_decoder_hyps.extend(hyps_str)
 
             # ════════════ Ground truth ════════════
-            all_refs.extend(batch.get("sentences", []))
+            batch_targets = batch.get("targets", [])
+            # Only extend up to args.max_examples to avoid collecting unnecessary examples
+            remaining = args.max_examples - collected_examples
+            if remaining <= 0:
+                break
+            if len(batch_targets) <= remaining:
+                all_refs.extend(batch_targets)
+                collected_examples += len(batch_targets)
+            else:
+                all_refs.extend(batch_targets[:remaining])
+                collected_examples += remaining
 
     # ═══════════════════════════════════════════════════════════
     # PRINT DIAGNOSTIC RESULTS
@@ -384,7 +439,7 @@ def main():
         """
     ✓ Se ENC (CTC Greedy) è SIMILE a REF (Ground Truth):
       → L'Encoder sta imparando i segni correttamente!
-      → Il problema è nel Decoder (exposure bias, alluccinazioni)
+    → Il problema è nel Decoder (exposure bias, allucinazioni)
       → Soluzione: Aumentare beam search, beam width, o aggiungere coverage penalty
       
     ✗ Se ENC (CTC Greedy) è DIVERSO da REF (Ground Truth):

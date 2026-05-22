@@ -327,3 +327,75 @@ def debug_attention_on_batch(model, batch, tokenizer, device, output_dir=None):
         visualizer.save_heatmaps(Path(output_dir), prefix="batch_debug")
     
     return visualizer
+
+
+def run_attention_visualization_on_loader(
+    model,
+    loader,
+    tokenizer,
+    device,
+    output_dir,
+    epoch: int = None,
+    max_batches: int = 1,
+    top_k: int = 5,
+    save_heatmaps: bool = True,
+):
+    """
+    Run attention capture on up to `max_batches` from `loader` and save summaries/heatmaps.
+
+    Intended to be called from the training loop (e.g. every N epochs).
+
+    Args:
+        model: SignLanguageTransformer instance
+        loader: DataLoader yielding batches compatible with `debug_attention_on_batch`
+        tokenizer: SentenceTokenizer instance
+        device: torch.device or string
+        output_dir: path-like where heatmaps will be written
+        epoch: optional int epoch number for filename prefixes
+        max_batches: how many batches to process (default 1)
+        top_k: how many top encoder positions to print in summary
+        save_heatmaps: whether to save PNG heatmaps (requires matplotlib)
+
+    Returns:
+        List of AttentionVisualizer instances produced for each processed batch
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Preserve training/eval state
+    was_training = model.training
+    model.eval()
+
+    visualizers = []
+    device = torch.device(device if isinstance(device, str) and torch.cuda.is_available() and device == "cuda" else device)
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(loader):
+            if batch_idx >= max_batches:
+                break
+
+            vis = AttentionVisualizer(model)
+
+            src = batch["src"].to(device)
+            tgt_input = batch["tgt_input"].to(device)
+            src_mask = batch.get("src_key_padding_mask", None)
+            if src_mask is not None:
+                src_mask = src_mask.to(device)
+
+            # Print padding info and capture attention
+            vis.print_padding_mask_info(src_mask)
+            vis.capture_attention_manual(src, tgt_input, src_mask, None, device)
+            vis.print_attention_summary(top_k=top_k)
+
+            if save_heatmaps:
+                prefix = f"epoch_{epoch:03d}" if epoch is not None else "epoch_unknown"
+                prefix = f"{prefix}_batch_{batch_idx:02d}"
+                vis.save_heatmaps(output_dir, prefix=prefix)
+
+            visualizers.append(vis)
+
+    # restore training state
+    if was_training:
+        model.train()
+
+    return visualizers
