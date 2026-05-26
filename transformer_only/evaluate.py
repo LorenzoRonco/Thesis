@@ -17,6 +17,7 @@ Utilizzo:
     --landmarks_dir dataset/landmarks_dev \
     --train_csv  dataset/PHOENIX-2014-T.train.corpus.csv \
     --train_landmarks_dir dataset/landmarks_train
+    --target_field translation o orth 
 """
 
 import argparse

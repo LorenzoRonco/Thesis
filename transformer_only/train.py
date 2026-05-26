@@ -327,7 +327,7 @@ def main():
         "train_landmarks_dir": "dataset/landmarks_train",
         "val_landmarks_dir":   "dataset/landmarks_dev",
         "output_dir":          "outputs/phoenix_run1",
-        "target_field":        "orth",   # oppure "orth" per i gloss
+        "target_field":        "orth",   # "orth" per i gloss, "translation" per le traduzioni in tedesco
 
         "device":  "cuda",
         "use_amp": True,
@@ -348,7 +348,7 @@ def main():
         "temporal_blocks":      1,
 
         # Training
-        "epochs":       100,
+        "epochs":       150,
         "batch_size":   32,
         "lr":           5e-4,
         "weight_decay": 1e-4,
@@ -357,12 +357,12 @@ def main():
         "num_workers":  4,
 
         # Pesi per gruppo di landmark
-        "pose_weight": 1.0,
+        "pose_weight": 0.8,
         "hand_weight": 1.5,   # mani più importanti per la LIS
-        "face_weight": 0.8,
+        "face_weight": 0.5,
 
         # Normalizzazione relativa alle mani
-        "use_hand_relative_norm": True,
+        "use_hand_relative_norm": False,
 
         # Tokenizer
         "tokenizer_min_freq": 1,
@@ -395,7 +395,7 @@ def main():
         # Set to N to run visualization every N epochs (None to disable)
         "attention_viz_every": 10,
         "attention_viz_max_batches": 2,
-        "attention_viz_save": True,
+        "attention_viz_save": False,
     }
 
     # ─────── Override da CLI ───────────────────────────────
