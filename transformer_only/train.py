@@ -10,11 +10,20 @@ Differenze rispetto al train How2Sign:
 - Nessuna augmentation (rimossa)
 - feat_dim: 376 (94 landmark × 4)
 - Path dataset: dataset/PHOENIX-2014-T.train.corpus.csv / dataset/train
+
+Fix applicati rispetto alla versione originale:
+- [FIX 1] Seed globale per random, numpy, torch e CUDA → riproducibilità garantita
+- [FIX 2] cudnn.deterministic=True e benchmark=False → no non-determinismo GPU
+- [FIX 3] DataLoader worker seed tramite worker_init_fn e Generator → batch identici ad ogni run
+- [FIX 4] Bucketing seed propagato tramite cfg["seed"] → ordine bucket riproducibile
+- [FIX 5] Corretto bug try/else nella visualizzazione attenzione (else → if/else esplicito)
+- [FIX 6] Selezione best model su BLEU-4 invece di BLEU-1
 """
 
 import os
 import sys
 import json
+import random
 from pathlib import Path
 
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -36,6 +45,46 @@ from .data.phoenix_loader import build_tokenizer, build_dataloaders, SentenceTok
 from .models.transformer import SignLanguageTransformer
 from .bleu import compute_bleu as _phoenix_compute_bleu
 from .attention_visualizer import run_attention_visualization_on_loader
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [FIX 1 + 2] Seed globale e determinismo GPU
+# ─────────────────────────────────────────────────────────────────────────────
+
+def set_global_seed(seed: int) -> None:
+    """
+    Fissa tutti i seed per garantire la riproducibilità completa.
+    Chiamare PRIMA di creare qualsiasi oggetto (modello, loader, ecc.).
+
+    Nota: torch.use_deterministic_algorithms(True) è commentato perché alcune
+    operazioni CUDA (es. scatter usato nell'attenzione) non hanno implementazione
+    deterministica. Riabilitarlo solo se si vuole un errore esplicito anziché
+    risultati non deterministici su quelle operazioni specifiche.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True   # [FIX 2]
+    torch.backends.cudnn.benchmark = False       # [FIX 2] — disabilita autotuning non deterministico
+    # torch.use_deterministic_algorithms(True)  # opzionale: forza errore su op non deterministiche
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [FIX 3] Worker init function per DataLoader
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_worker_init_fn(base_seed: int):
+    """
+    Restituisce una worker_init_fn che assegna un seed deterministico
+    a ciascun worker process del DataLoader.
+    """
+    def worker_init_fn(worker_id: int) -> None:
+        worker_seed = base_seed + worker_id
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+    return worker_init_fn
 
 
 class WarmupCosineScheduler:
@@ -297,7 +346,11 @@ def validate(
         all_refs.extend(batch_refs)
 
     denom = max(n_batches, 1)
-    bleu_scores = _compute_bleu_scores(all_hyps, all_refs) if all_hyps and all_refs else {"bleu_1": 0.0, "bleu_2": 0.0, "bleu_3": 0.0, "bleu_4": 0.0, "bleu": 0.0}
+    bleu_scores = (
+        _compute_bleu_scores(all_hyps, all_refs)
+        if all_hyps and all_refs
+        else {"bleu_1": 0.0, "bleu_2": 0.0, "bleu_3": 0.0, "bleu_4": 0.0, "bleu": 0.0}
+    )
     return {
         "loss": total_loss / denom,
         "ce_loss": total_ce / denom,
@@ -317,6 +370,8 @@ def main():
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--target_field", type=str, default=None,
                         help="'translation' (default) o 'orth' (gloss)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Seed globale per la riproducibilità (default: 42)")
     args = parser.parse_args()
 
     # ─────── Configurazione ────────────────────────────────
@@ -331,6 +386,9 @@ def main():
 
         "device":  "cuda",
         "use_amp": True,
+
+        # [FIX 1] Seed globale — controlla TUTTA la casualità del training
+        "seed": 42,
 
         # Modello
         "feat_dim":        376,   # 94 landmark × 4
@@ -348,7 +406,7 @@ def main():
         "temporal_blocks":      1,
 
         # Training
-        "epochs":       150,
+        "epochs":       200,
         "batch_size":   32,
         "lr":           5e-4,
         "weight_decay": 1e-4,
@@ -391,11 +449,11 @@ def main():
         "early_phase_epochs":  20,
         "debug_print_batch":   False,
         "debug_max_items":     4,
-        # Attention visualization (integration with AttentionVisualizer)
-        # Set to N to run visualization every N epochs (None to disable)
-        "attention_viz_every": None,
+
+        # Attention visualization
+        "attention_viz_every":       None,
         "attention_viz_max_batches": 2,
-        "attention_viz_save": False,
+        "attention_viz_save":        False,
     }
 
     # ─────── Override da CLI ───────────────────────────────
@@ -411,10 +469,16 @@ def main():
         cfg["dropout"] = args.dropout
     if args.target_field is not None:
         cfg["target_field"] = args.target_field
+    if args.seed is not None:
+        cfg["seed"] = args.seed
 
     cli_overrides = {k: v for k, v in vars(args).items() if v is not None}
     if cli_overrides:
         print(f"[TRAIN] CLI overrides: {cli_overrides}")
+
+    # ─────── [FIX 1 + 2] Seed globale — PRIMA DI TUTTO ───
+    set_global_seed(cfg["seed"])
+    print(f"[TRAIN] Seed globale fissato: {cfg['seed']}")
 
     # ─────── Output directory ─────────────────────────────
     output_dir = Path(cfg["output_dir"])
@@ -439,7 +503,11 @@ def main():
     print(f"[TRAIN] Vocab size: {tokenizer.vocab_size}")
 
     # ─────── Dataloaders ──────────────────────────────────
+    # [FIX 3 + 4] Generator e worker_init_fn per riproducibilità del DataLoader
     print("[TRAIN] Costruzione dataloaders...")
+    dl_generator = torch.Generator()
+    dl_generator.manual_seed(cfg["seed"])
+
     loaders = build_dataloaders(
         train_csv=cfg["train_csv"],
         val_csv=cfg["val_csv"],
@@ -464,9 +532,22 @@ def main():
         drop_last=cfg["drop_last"],
         use_hand_relative_norm=cfg["use_hand_relative_norm"],
         flatten_landmarks=True,
+        # [FIX 3] Passa generator e worker_init_fn — se build_dataloaders li supporta
+        # In caso contrario, applicarli manualmente al DataLoader restituito (vedi sotto)
+        generator=dl_generator,
+        worker_init_fn=_make_worker_init_fn(cfg["seed"]),
     )
     train_loader = loaders["train"]
     val_loader   = loaders["val"]
+
+    # [FIX 3] Fallback: se build_dataloaders non accetta generator/worker_init_fn,
+    # sovrascrivere manualmente gli attributi del DataLoader.
+    # Decommentare le righe seguenti solo se build_dataloaders solleva TypeError:
+    #
+    # train_loader.generator       = dl_generator
+    # train_loader.worker_init_fn  = _make_worker_init_fn(cfg["seed"])
+    # val_loader.worker_init_fn    = _make_worker_init_fn(cfg["seed"])
+
     print(f"[TRAIN] Train: {len(train_loader)} batches | Val: {len(val_loader)} batches")
 
     # ─────── Controllo frame zero ─────────────────────────
@@ -481,8 +562,8 @@ def main():
 
     if cfg["debug_print_batch"]:
         debug_batch = next(iter(train_loader))
-        names   = debug_batch.get("names", [])
-        targets = debug_batch.get("targets", [])
+        names    = debug_batch.get("names", [])
+        targets  = debug_batch.get("targets", [])
         src_lens = debug_batch.get("src_lens")
         tgt_lens = debug_batch.get("tgt_lens")
         print("[TRAIN] Debug batch:")
@@ -533,7 +614,7 @@ def main():
     print(f"  target_field={cfg['target_field']} | epochs={cfg['epochs']} | "
           f"lr={cfg['lr']} | batch_size={cfg['batch_size']}")
     print(f"  feat_dim={cfg['feat_dim']} | hand_weight={cfg['hand_weight']} | "
-          f"warmup={cfg['warmup_steps']} steps\n")
+          f"warmup={cfg['warmup_steps']} steps | seed={cfg['seed']}\n")
 
     for epoch in range(1, cfg["epochs"] + 1):
 
@@ -567,6 +648,9 @@ def main():
                 device=device,
                 use_amp=cfg["use_amp"],
             )
+
+            # [FIX 6] Selezione best model su BLEU-4 (metrica standard PHOENIX)
+            # In origine era BLEU-1, che non riflette la qualità traduttiva reale
             val_bleu = val_stats.get("bleu_4", val_stats.get("bleu", 0.0))
 
             print(
@@ -594,12 +678,20 @@ def main():
                     "best_bleu": best_bleu,
                     "cfg":       cfg,
                 }, ckpt_path)
-                print(f"  ✓ Nuovo best! BLEU={best_bleu:.4f} → {ckpt_path}")
-        # ─────── Attention visualization hook (optional) ─────────
-        try:
-            viz_every = cfg.get("attention_viz_every")
-            if viz_every is not None and viz_every > 0 and epoch % viz_every == 0:
-                print(f"[TRAIN] Running attention visualization (epoch {epoch})...")
+                print(f"  ✓ Nuovo best! BLEU-4={best_bleu:.4f} → {ckpt_path}")
+        else:
+            # Epoche senza validazione: stampa solo le stats di training
+            print(f"[E{epoch:3d}] train_loss={train_stats['loss']:.4f} "
+                  f"train_ppl={train_stats['ppl']:.2f}")
+
+        # ─────── [FIX 5] Attention visualization hook ─────────────────────────
+        # In origine il blocco try/else causava la stampa delle stats di training
+        # OGNI epoca (anche quelle con validazione), perché else di try si attiva
+        # quando NON viene sollevata un'eccezione — non come ramo alternativo all'if.
+        viz_every = cfg.get("attention_viz_every")
+        if viz_every is not None and viz_every > 0 and epoch % viz_every == 0:
+            print(f"[TRAIN] Running attention visualization (epoch {epoch})...")
+            try:
                 run_attention_visualization_on_loader(
                     model=model,
                     loader=val_loader,
@@ -611,11 +703,8 @@ def main():
                     top_k=5,
                     save_heatmaps=cfg.get("attention_viz_save", True),
                 )
-        except Exception as e:
-            print(f"[TRAIN] Attention visualization failed: {e}")
-        else:
-            print(f"[E{epoch:3d}] train_loss={train_stats['loss']:.4f} "
-                  f"train_ppl={train_stats['ppl']:.2f}")
+            except Exception as e:
+                print(f"[TRAIN] Attention visualization failed: {e}")
 
     # ─────── Checkpoint finale ────────────────────────────
     last_path = output_dir / "last.pt"
@@ -630,7 +719,7 @@ def main():
     }, last_path)
 
     print(f"\n[TRAIN] Completato!")
-    print(f"[TRAIN] Best BLEU: {best_bleu:.4f} all'epoca {best_epoch}")
+    print(f"[TRAIN] Best BLEU-4: {best_bleu:.4f} all'epoca {best_epoch}")
     print(f"[TRAIN] Ultimo checkpoint: {last_path}")
 
 

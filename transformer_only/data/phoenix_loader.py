@@ -34,7 +34,7 @@ import random
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -678,6 +678,8 @@ def build_dataloaders(
     drop_last:           bool = False,
     use_hand_relative_norm: bool = True,
     flatten_landmarks:   bool = True,
+    generator: Optional[torch.Generator] = None,
+    worker_init_fn: Optional[Callable[[int], None]] = None,
 ) -> dict[str, DataLoader]:
     """
     Restituisce {"train": DataLoader, "val": DataLoader, ["test": DataLoader]}.
@@ -773,6 +775,8 @@ def build_dataloaders(
                 collate_fn=_collate,
                 pin_memory=pin_memory,
                 persistent_workers=(num_workers > 0),
+                generator=generator,
+                worker_init_fn=worker_init_fn,
             )
 
         return DataLoader(
@@ -783,6 +787,8 @@ def build_dataloaders(
             collate_fn=_collate,
             pin_memory=pin_memory,
             persistent_workers=(num_workers > 0),
+                generator=generator,
+                worker_init_fn=worker_init_fn,
         )
 
     loaders: dict[str, DataLoader] = {
