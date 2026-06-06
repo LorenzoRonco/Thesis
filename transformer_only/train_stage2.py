@@ -15,12 +15,19 @@ separato direttamente dalle colonne 'orth' del CSV.
 Utilizzo:
   python train_stage2.py
   python train_stage2.py --epochs 50 --lr 1e-3
+
+Fix applicati rispetto alla versione originale:
+- [FIX 1] Seed globale per random, numpy, torch e CUDA → riproducibilità garantita
+- [FIX 2] cudnn.deterministic=True e benchmark=False → no non-determinismo GPU
+- [FIX 3] DataLoader worker seed tramite worker_init_fn e Generator → batch identici ad ogni run
+- [FIX 4] "seed" aggiunto a cfg e overridabile da CLI (--seed)
 """
 
 import os
 import sys
 import csv
 import json
+import random
 from pathlib import Path
 from functools import partial
 
@@ -40,6 +47,40 @@ import numpy as np
 from .data.phoenix_loader import SentenceTokenizer, build_tokenizer
 from .two_stage import GlossToTextTransformer
 from .train import WarmupCosineScheduler   # scheduler già esistente
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [FIX 1 + 2] Seed globale e determinismo GPU
+# ─────────────────────────────────────────────────────────────────────────────
+
+def set_global_seed(seed: int) -> None:
+    """
+    Fissa tutti i seed per garantire la riproducibilità completa.
+    Chiamare PRIMA di creare qualsiasi oggetto (modello, loader, ecc.).
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True   # [FIX 2]
+    torch.backends.cudnn.benchmark = False       # [FIX 2]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [FIX 3] Worker init function per DataLoader
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_worker_init_fn(base_seed: int):
+    """
+    Restituisce una worker_init_fn che assegna un seed deterministico
+    a ciascun worker process del DataLoader.
+    """
+    def worker_init_fn(worker_id: int) -> None:
+        worker_seed = base_seed + worker_id
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+    return worker_init_fn
 
 
 # ─────────────────────────────────────────────
@@ -146,16 +187,16 @@ def collate_stage2(batch: list[dict], gloss_pad_id: int, trans_pad_id: int) -> d
     tgt_out_mask = trans_mask[:, 1:]
 
     return {
-        "gloss":                 gloss_padded,
-        "gloss_key_padding_mask":gloss_mask,
-        "tgt_input":             tgt_input,
-        "tgt_output":            tgt_output,
+        "gloss":                   gloss_padded,
+        "gloss_key_padding_mask":  gloss_mask,
+        "tgt_input":               tgt_input,
+        "tgt_output":              tgt_output,
         "tgt_in_key_padding_mask": tgt_in_mask,
-        "gloss_lens":            torch.tensor(gloss_lens),
-        "trans_lens":            torch.tensor(trans_lens),
-        "names":                 [item["name"]       for item in batch],
-        "orths":                 [item["orth"]        for item in batch],
-        "trans_texts":           [item["trans_text"]  for item in batch],
+        "gloss_lens":              torch.tensor(gloss_lens),
+        "trans_lens":              torch.tensor(trans_lens),
+        "names":                   [item["name"]       for item in batch],
+        "orths":                   [item["orth"]        for item in batch],
+        "trans_texts":             [item["trans_text"]  for item in batch],
     }
 
 
@@ -163,12 +204,12 @@ def collate_stage2(batch: list[dict], gloss_pad_id: int, trans_pad_id: int) -> d
 # Validazione rapida (BLEU-4)
 # ─────────────────────────────────────────────
 def validate_stage2(
-    model:         GlossToTextTransformer,
-    loader:        DataLoader,
+    model:           GlossToTextTransformer,
+    loader:          DataLoader,
     trans_tokenizer: SentenceTokenizer,
-    device:        torch.device,
-    use_amp:       bool = True,
-    max_decode_len: int = 128,
+    device:          torch.device,
+    use_amp:         bool = True,
+    max_decode_len:  int = 128,
 ) -> dict:
     from bleu import compute_bleu as _phoenix_bleu
 
@@ -225,11 +266,19 @@ def validate_stage2(
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Train GlossToTextTransformer (Stage 2)")
-    parser.add_argument("--epochs",    type=int,   default=None)
-    parser.add_argument("--lr",        type=float, default=None)
-    parser.add_argument("--batch_size",type=int,   default=None)
-    parser.add_argument("--stage1_dir",type=str,   default=None,
+    parser.add_argument("--epochs",     type=int,   default=None)
+    parser.add_argument("--lr",         type=float, default=None)
+    parser.add_argument("--batch_size", type=int,   default=None)
+    parser.add_argument("--stage1_dir", type=str,   default=None,
                         help="Output dir del Modello 1 (per caricare il tokenizer gloss)")
+    parser.add_argument("--seed",       type=int,   default=None,
+                        help="Seed globale per la riproducibilità (default: 42)")
+    parser.add_argument("--early_stage_val_interval", type=int, default=None,
+                        help="Ogni quante epoche eseguire la validazione BLEU nella early stage")
+    parser.add_argument("--early_stage_end_epoch", type=int, default=None,
+                        help="Ultima epoca inclusa nella early stage")
+    parser.add_argument("--post_early_stage_val_interval", type=int, default=None,
+                        help="Ogni quante epoche eseguire la validazione BLEU dopo la early stage")
     args = parser.parse_args()
 
     cfg = {
@@ -246,6 +295,9 @@ def main():
 
         "device":  "cuda",
         "use_amp": True,
+
+        # [FIX 4] Seed globale — controlla TUTTA la casualità del training
+        "seed": 42,
 
         # Modello 2 — intenzionalmente più leggero del Modello 1
         # (il task gloss→tedesco è più semplice di landmark→tedesco)
@@ -269,15 +321,28 @@ def main():
         "num_workers":  4,
 
         # Validazione
-        "val_interval":     5,
-        "max_decode_len":   128,
+        "early_stage_val_interval":      5,
+        "early_stage_end_epoch":        20,
+        "post_early_stage_val_interval": 1,
+        "max_decode_len":               128,
     }
 
     # Override da CLI
-    if args.epochs is not None:     cfg["epochs"]     = args.epochs
-    if args.lr is not None:         cfg["lr"]         = args.lr
-    if args.batch_size is not None: cfg["batch_size"] = args.batch_size
+    if args.epochs is not None:     cfg["epochs"]            = args.epochs
+    if args.lr is not None:         cfg["lr"]                = args.lr
+    if args.batch_size is not None: cfg["batch_size"]        = args.batch_size
     if args.stage1_dir is not None: cfg["stage1_output_dir"] = args.stage1_dir
+    if args.seed is not None:       cfg["seed"]              = args.seed
+    if args.early_stage_val_interval is not None:
+        cfg["early_stage_val_interval"] = args.early_stage_val_interval
+    if args.early_stage_end_epoch is not None:
+        cfg["early_stage_end_epoch"] = args.early_stage_end_epoch
+    if args.post_early_stage_val_interval is not None:
+        cfg["post_early_stage_val_interval"] = args.post_early_stage_val_interval
+
+    # ─────── [FIX 1 + 2] Seed globale — PRIMA DI TUTTO ───
+    set_global_seed(cfg["seed"])
+    print(f"[STAGE2] Seed globale fissato: {cfg['seed']}")
 
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -334,15 +399,30 @@ def main():
         max_gloss_len=cfg["max_gloss_len"], max_trans_len=cfg["max_trans_len"],
     )
 
+    # [FIX 3] Generator e worker_init_fn per riproducibilità del DataLoader
+    dl_generator = torch.Generator()
+    dl_generator.manual_seed(cfg["seed"])
+
     train_loader = DataLoader(
-        train_ds, batch_size=cfg["batch_size"], shuffle=True,
-        num_workers=cfg["num_workers"], collate_fn=_collate,
-        pin_memory=True, persistent_workers=(cfg["num_workers"] > 0),
+        train_ds,
+        batch_size=cfg["batch_size"],
+        shuffle=True,
+        num_workers=cfg["num_workers"],
+        collate_fn=_collate,
+        pin_memory=True,
+        persistent_workers=(cfg["num_workers"] > 0),
+        generator=dl_generator,                          # [FIX 3] shuffle deterministico
+        worker_init_fn=_make_worker_init_fn(cfg["seed"]), # [FIX 3] worker seed
     )
     val_loader = DataLoader(
-        val_ds, batch_size=cfg["batch_size"] * 2, shuffle=False,
-        num_workers=cfg["num_workers"], collate_fn=_collate,
-        pin_memory=True, persistent_workers=(cfg["num_workers"] > 0),
+        val_ds,
+        batch_size=cfg["batch_size"] * 2,
+        shuffle=False,
+        num_workers=cfg["num_workers"],
+        collate_fn=_collate,
+        pin_memory=True,
+        persistent_workers=(cfg["num_workers"] > 0),
+        worker_init_fn=_make_worker_init_fn(cfg["seed"]), # [FIX 3] worker seed
     )
     print(f"[STAGE2] Train: {len(train_loader)} batch | Val: {len(val_loader)} batch")
 
@@ -379,17 +459,17 @@ def main():
     best_epoch = 0
 
     print(f"\n[STAGE2] Inizio training gloss→translation")
-    print(f"  epochs={cfg['epochs']} | lr={cfg['lr']} | batch={cfg['batch_size']}\n")
+    print(f"  epochs={cfg['epochs']} | lr={cfg['lr']} | batch={cfg['batch_size']} | seed={cfg['seed']}\n")
 
     for epoch in range(1, cfg["epochs"] + 1):
         model.train()
         total_loss = total_tok = 0
         for batch_idx, batch in enumerate(train_loader):
-            gloss   = batch["gloss"].to(device)
-            gloss_m = batch["gloss_key_padding_mask"].to(device)
-            tgt_in  = batch["tgt_input"].to(device)
-            tgt_out = batch["tgt_output"].to(device)
-            tgt_in_m= batch["tgt_in_key_padding_mask"].to(device)
+            gloss    = batch["gloss"].to(device)
+            gloss_m  = batch["gloss_key_padding_mask"].to(device)
+            tgt_in   = batch["tgt_input"].to(device)
+            tgt_out  = batch["tgt_output"].to(device)
+            tgt_in_m = batch["tgt_in_key_padding_mask"].to(device)
 
             optimizer.zero_grad()
             with autocast(device_type=device.type, enabled=cfg["use_amp"]):
@@ -415,44 +495,51 @@ def main():
         avg_loss = total_loss / max(1, total_tok)
         ppl      = torch.exp(torch.tensor(min(avg_loss, 20.0))).item()
 
-        if epoch % cfg["val_interval"] == 0:
+        is_early_stage = epoch <= cfg["early_stage_end_epoch"]
+        val_interval = (
+            cfg["early_stage_val_interval"] if is_early_stage
+            else cfg["post_early_stage_val_interval"]
+        )
+
+        if epoch % val_interval == 0:
             val_stats = validate_stage2(
                 model, val_loader, trans_tokenizer, device,
                 use_amp=cfg["use_amp"], max_decode_len=cfg["max_decode_len"],
             )
+            stage_label = "early" if is_early_stage else "post-early"
             print(
                 f"[E{epoch:3d}] train_loss={avg_loss:.4f} ppl={ppl:.2f} | "
                 f"val_loss={val_stats['loss']:.4f} val_ppl={val_stats['ppl']:.2f} "
-                f"val_bleu={val_stats['bleu']:.2f}"
+                f"val_bleu={val_stats['bleu']:.2f} ({stage_label}, every {val_interval} epoche)"
             )
             if val_stats["bleu"] > best_bleu:
                 best_bleu  = val_stats["bleu"]
                 best_epoch = epoch
                 ckpt_path  = output_dir / "best.pt"
                 torch.save({
-                    "epoch":      epoch,
-                    "model":      model.state_dict(),
-                    "optimizer":  optimizer.state_dict(),
-                    "best_bleu":  best_bleu,
-                    "cfg":        cfg,
+                    "epoch":             epoch,
+                    "model":             model.state_dict(),
+                    "optimizer":         optimizer.state_dict(),
+                    "best_bleu":         best_bleu,
+                    "cfg":               cfg,
                     "gloss_vocab_size":  gloss_tokenizer.vocab_size,
                     "trans_vocab_size":  trans_tokenizer.vocab_size,
                 }, ckpt_path)
-                print(f"  ✓ Nuovo best! BLEU={best_bleu:.2f} → {ckpt_path}")
+                print(f"  ✓ Nuovo best! BLEU-4={best_bleu:.2f} → {ckpt_path}")
         else:
             print(f"[E{epoch:3d}] train_loss={avg_loss:.4f} ppl={ppl:.2f}")
 
     # Checkpoint finale
     torch.save({
-        "epoch":     cfg["epochs"],
-        "model":     model.state_dict(),
-        "best_bleu": best_bleu,
-        "cfg":       cfg,
+        "epoch":            cfg["epochs"],
+        "model":            model.state_dict(),
+        "best_bleu":        best_bleu,
+        "cfg":              cfg,
         "gloss_vocab_size": gloss_tokenizer.vocab_size,
         "trans_vocab_size": trans_tokenizer.vocab_size,
     }, output_dir / "last.pt")
 
-    print(f"\n[STAGE2] Completato! Best BLEU: {best_bleu:.2f} all'epoca {best_epoch}")
+    print(f"\n[STAGE2] Completato! Best BLEU-4: {best_bleu:.2f} all'epoca {best_epoch}")
 
 
 if __name__ == "__main__":

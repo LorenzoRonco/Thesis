@@ -406,7 +406,7 @@ def main():
         "temporal_blocks":      1,
 
         # Training
-        "epochs":       200,
+        "epochs":       300,
         "batch_size":   32,
         "lr":           5e-4,
         "weight_decay": 1e-4,
@@ -445,8 +445,8 @@ def main():
         # Logging e validazione
         "log_interval":        50,
         "val_interval_early":  5,
-        "val_interval_late":   2,
-        "early_phase_epochs":  20,
+        "val_interval_late":   1,
+        "early_phase_epochs":  100,
         "debug_print_batch":   False,
         "debug_max_items":     4,
 
