@@ -393,7 +393,7 @@ def main():
         "debug_max_items":     4,
         # Attention visualization (integration with AttentionVisualizer)
         # Set to N to run visualization every N epochs (None to disable)
-        "attention_viz_every": 10,
+        "attention_viz_every": None,
         "attention_viz_max_batches": 2,
         "attention_viz_save": False,
     }
@@ -567,7 +567,7 @@ def main():
                 device=device,
                 use_amp=cfg["use_amp"],
             )
-            val_bleu = val_stats.get("bleu_1", val_stats.get("bleu", 0.0))
+            val_bleu = val_stats.get("bleu_4", val_stats.get("bleu", 0.0))
 
             print(
                 f"[E{epoch:3d}] "
