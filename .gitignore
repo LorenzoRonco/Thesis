@@ -50,3 +50,6 @@ video_integrity_report.txt
 .venv
 
 visualization_output
+
+outputs
+outputs/
