@@ -1,76 +1,75 @@
 """
-two_stage.py
+two_stage_hybrid.py
 
-Architettura a due stadi per Sign Language Translation su PHOENIX-2014-T.
+Architettura ibrida per lo Stadio 2: gloss → translation (tedesco)
 
-Stadio 1 — SignLanguageTransformer (transformer.py, invariato):
-    landmark → gloss (orth)
-    Input:  (B, T, feat_dim)
-    Output: sequenza di gloss token
+    GlossEncoder custom  →  Bridge (d_model → 1024)  →  mBART Decoder + LoRA
 
-Stadio 2 — GlossToTextTransformer (questo file):
-    gloss → translation (tedesco)
-    Input:  (B, G) token id di gloss
-    Output: (B, L) token id di traduzione
+Perché funziona meglio di mBART puro:
+  - L'encoder è addestrato da zero appositamente per le gloss PHOENIX
+    (parole tedesche in maiuscolo, telegrafiche) → nessun domain gap sul lato encoder
+  - Il decoder è mBART pre-addestrato sul tedesco → genera tedesco fluente
+    senza doverlo imparare da zero
+  - Il bridge lineare (256→1024 + LayerNorm) adatta le dimensioni
+  - LoRA sul solo decoder: i pesi dell'encoder mBART vengono caricati ma
+    congelati e mai eseguiti (bypassati tramite encoder_outputs)
 
-Il training dei due modelli è completamente indipendente:
-  - Modello 1 si allena su target_field='orth'
-  - Modello 2 si allena su coppie (orth, translation) dal CSV
-
-Durante l'inferenza, TwoStagePipeline:
-  1. Chiama greedy_decode di Modello 1 → lista di gloss id
-  2. Ri-tokenizza i gloss (opzionalmente con il tokenizer del Modello 2)
-  3. Passa la sequenza al Modello 2 → traduzione finale
+Classi esportate:
+  - GlossEncoder           : encoder custom per token di gloss
+  - HybridGlossToText      : GlossEncoder + bridge + mBART decoder
+  - TwoStagePipelineHybrid : inferenza landmark → gloss → tedesco
 """
 
+from __future__ import annotations
+
 import math
-import copy
-from typing import Optional
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-# Riutilizziamo i building block del transformer esistente
+from transformers import MBartForConditionalGeneration, MBartTokenizer
+from transformers.modeling_outputs import BaseModelOutput
+from peft import LoraConfig, TaskType, get_peft_model, PeftModel
+
 from .models.transformer import (
-    TransformerDecoderLayerWithAttn,
-    TransformerDecoderWithAttn,
-    TokenEmbedding,
     SinusoidalPositionalEncoding,
     SignLanguageTransformer,
 )
 
 
-# ─────────────────────────────────────────────
-# Encoder testuale per gloss
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Encoder gloss custom (identico a quello di two_stage.py originale)
+# ─────────────────────────────────────────────────────────────────────────────
+
 class GlossEncoder(nn.Module):
     """
-    Encoder che trasforma una sequenza di gloss token in rappresentazioni
-    contestuali (B, G, d_model).
+    Encoder Transformer per sequenze di gloss token.
 
-    È un semplice Transformer encoder su embedding di token, identico al
-    decoder encoder del Modello 1 ma applicato ai gloss.
+    Trasforma (B, G) token id → (B, G, d_model) rappresentazioni contestuali.
+    Addestrato da zero su PHOENIX: impara la distribuzione specifica delle
+    gloss (parole tedesche in maiuscolo, abbreviate, telegrafiche).
     """
 
     def __init__(
         self,
         gloss_vocab_size: int,
-        d_model: int,
-        nhead: int,
-        num_layers: int,
-        dim_feedforward: int,
-        dropout: float,
-        max_len: int,
-        pad_id: int,
+        d_model:          int,
+        nhead:            int,
+        num_layers:       int,
+        dim_feedforward:  int,
+        dropout:          float,
+        max_len:          int,
+        pad_id:           int,
     ):
         super().__init__()
-        self.pad_id = pad_id
+        self.pad_id    = pad_id
         self.embedding = nn.Embedding(gloss_vocab_size, d_model, padding_idx=pad_id)
-        self.scale = math.sqrt(d_model)
-        self.pos_enc = SinusoidalPositionalEncoding(d_model, max_len=max_len, dropout=dropout)
-        self.norm_in = nn.LayerNorm(d_model)
+        self.scale     = math.sqrt(d_model)
+        self.pos_enc   = SinusoidalPositionalEncoding(d_model, max_len=max_len, dropout=dropout)
+        self.norm_in   = nn.LayerNorm(d_model)
 
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -89,76 +88,79 @@ class GlossEncoder(nn.Module):
 
     def forward(
         self,
-        gloss_ids: Tensor,                     # (B, G)
-        gloss_key_padding_mask: Tensor | None = None,  # (B, G) True=pad
-    ) -> Tensor:                               # (B, G, d_model)
+        gloss_ids:               Tensor,            # (B, G)
+        gloss_key_padding_mask:  Tensor | None = None,  # (B, G) True=pad
+    ) -> Tensor:                                    # (B, G, d_model)
         x = self.embedding(gloss_ids) * self.scale
         x = self.pos_enc(x)
         x = self.norm_in(x)
         if gloss_key_padding_mask is not None:
             x = x.masked_fill(gloss_key_padding_mask.unsqueeze(-1), 0.0)
-        memory = self.encoder(x, src_key_padding_mask=gloss_key_padding_mask)
-        return memory
+        return self.encoder(x, src_key_padding_mask=gloss_key_padding_mask)
 
 
-# ─────────────────────────────────────────────
-# Modello 2: Gloss → Translation
-# ─────────────────────────────────────────────
-class GlossToTextTransformer(nn.Module):
+# ─────────────────────────────────────────────────────────────────────────────
+# Architettura ibrida: GlossEncoder + Bridge + mBART Decoder
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HybridGlossToText(nn.Module):
     """
-    Seq2seq Transformer: gloss (orth) → translation (tedesco).
+    GlossEncoder custom + Bridge lineare + mBART Decoder con LoRA.
 
-    Architettura identica al decoder del Modello 1, ma:
-      - L'encoder elabora gloss token (non landmark)
-      - Il decoder genera token di traduzione
-      - Vocabolari sorgente e target possono essere diversi
-        (gloss_vocab != translation_vocab)
+    Flusso forward (training):
+        gloss_ids  ──► GlossEncoder ──► (B, G, d_model)
+                                          │
+                                        Bridge  ──► (B, G, 1024)
+                                          │
+                              encoder_outputs ──► mBART Decoder ──► loss / logits
+
+    Il decoder mBART riceve le rappresentazioni gloss proiettate come se
+    fossero l'output del suo encoder originale (via BaseModelOutput).
+    L'encoder mBART è caricato ma congelato e mai eseguito.
 
     Args:
-        gloss_vocab_size:    dimensione vocabolario gloss (Modello 1)
-        trans_vocab_size:    dimensione vocabolario traduzione
-        d_model:             dimensione nascosta
-        nhead:               teste di attenzione
-        num_enc_layers:      layer encoder gloss
-        num_dec_layers:      layer decoder traduzione
-        dim_feedforward:     dimensione FFN
-        dropout:             dropout
-        max_gloss_len:       lunghezza massima sequenza gloss
-        max_trans_len:       lunghezza massima traduzione
-        gloss_pad_id:        pad id nel vocabolario gloss
-        trans_pad_id:        pad id nel vocabolario traduzione
-        label_smoothing:     smoothing cross-entropy
-        share_vocab:         se True i due vocabolari sono identici e
-                             si condivide la embedding matrix
-                             (usabile solo se gloss_vocab == trans_vocab)
+        gloss_vocab_size:        dimensione vocabolario gloss
+        d_model:                 dim nascosta del GlossEncoder
+        nhead:                   teste di attenzione del GlossEncoder
+        num_enc_layers:          layer del GlossEncoder
+        dim_feedforward:         dim FFN del GlossEncoder
+        dropout:                 dropout
+        max_gloss_len:           lunghezza max sequenza gloss
+        gloss_pad_id:            pad id nel vocabolario gloss
+        lora_r:                  rank LoRA per il decoder mBART
+        lora_alpha:              scaling LoRA (tipicamente 2×lora_r)
+        lora_dropout:            dropout negli adapter LoRA
+        lora_target_modules:     moduli del decoder su cui applicare LoRA
+        forced_bos_token_id:     id de_DE per forzare generazione in tedesco
+        gradient_checkpointing:  abilita gradient checkpointing sul decoder
     """
+
+    MBART_NAME    = "facebook/mbart-large-cc25"
+    MBART_D_MODEL = 1024   # dimensione nascosta di mBART-large
 
     def __init__(
         self,
-        gloss_vocab_size:  int,
-        trans_vocab_size:  int,
-        d_model:           int   = 256,
-        nhead:             int   = 4,
-        num_enc_layers:    int   = 2,
-        num_dec_layers:    int   = 2,
-        dim_feedforward:   int   = 512,
-        dropout:           float = 0.1,
-        max_gloss_len:     int   = 128,
-        max_trans_len:     int   = 128,
-        gloss_pad_id:      int   = 0,
-        trans_pad_id:      int   = 0,
-        label_smoothing:   float = 0.1,
-        share_vocab:       bool  = False,
+        gloss_vocab_size:     int,
+        d_model:              int   = 256,
+        nhead:                int   = 4,
+        num_enc_layers:       int   = 2,
+        dim_feedforward:      int   = 512,
+        dropout:              float = 0.1,
+        max_gloss_len:        int   = 64,
+        gloss_pad_id:         int   = 0,
+        lora_r:               int   = 16,
+        lora_alpha:           int   = 32,
+        lora_dropout:         float = 0.1,
+        lora_target_modules:  list  = None,
+        forced_bos_token_id:  int   = None,
+        gradient_checkpointing: bool = True,
     ):
         super().__init__()
 
-        self.d_model       = d_model
-        self.gloss_pad_id  = gloss_pad_id
-        self.trans_pad_id  = trans_pad_id
-        self.label_smoothing = label_smoothing
-        self.share_vocab   = share_vocab
+        self.gloss_pad_id = gloss_pad_id
+        self.d_model      = d_model
 
-        # ── Encoder gloss ──────────────────────
+        # ── 1. Encoder gloss (addestrato da zero su PHOENIX) ──────────────────
         self.gloss_encoder = GlossEncoder(
             gloss_vocab_size=gloss_vocab_size,
             d_model=d_model,
@@ -170,293 +172,296 @@ class GlossToTextTransformer(nn.Module):
             pad_id=gloss_pad_id,
         )
 
-        # ── Decoder traduzione ─────────────────
-        self.tgt_embed = TokenEmbedding(
-            vocab_size=trans_vocab_size,
-            d_model=d_model,
-            max_len=max_trans_len,
-            dropout=dropout,
+        # ── 2. Bridge: d_model → mBART hidden (1024) ─────────────────────────
+        # LayerNorm stabilizza la scala prima di entrare nel decoder mBART
+        # (che si aspetta input della stessa distribuzione dei suoi encoder output)
+        self.bridge = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, self.MBART_D_MODEL),
+            nn.LayerNorm(self.MBART_D_MODEL),
         )
 
-        dec_layer = TransformerDecoderLayerWithAttn(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+        # ── 3. mBART con LoRA sul solo decoder ────────────────────────────────
+        if lora_target_modules is None:
+            lora_target_modules = ["q_proj", "v_proj"]
+
+        base = MBartForConditionalGeneration.from_pretrained(self.MBART_NAME)
+
+        lora_cfg = LoraConfig(
+            task_type=TaskType.SEQ_2_SEQ_LM,
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=lora_target_modules,
+            lora_dropout=lora_dropout,
+            bias="none",
         )
-        self.decoder = TransformerDecoderWithAttn(
-            dec_layer,
-            num_layers=num_dec_layers,
-            norm=nn.LayerNorm(d_model),
-        )
+        self.mbart = get_peft_model(base, lora_cfg)
 
-        # ── Proiezione output ──────────────────
-        self.output_proj = nn.Linear(d_model, trans_vocab_size)
+        # Congela encoder mBART (encoder + eventuali LoRA su encoder):
+        # viene caricato ma mai eseguito (usiamo encoder_outputs per bypassarlo)
+        for name, param in self.mbart.named_parameters():
+            if "model.encoder" in name:
+                param.requires_grad = False
 
-        # Weight tying opzionale (solo se vocabolari identici)
-        if share_vocab:
-            assert gloss_vocab_size == trans_vocab_size, (
-                "share_vocab=True richiede gloss_vocab_size == trans_vocab_size"
-            )
-            self.gloss_encoder.embedding.weight = self.tgt_embed.embedding.weight
+        # Gradient checkpointing sul decoder mBART
+        if gradient_checkpointing:
+            self.mbart.enable_input_require_grads()
+            self.mbart.gradient_checkpointing_enable()
 
-        self._init_weights()
+        self.forced_bos_token_id = forced_bos_token_id
+        self.trans_pad_id        = self.mbart.config.pad_token_id
 
-    def _init_weights(self):
-        for name, p in self.named_parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-            elif "bias" in name:
-                nn.init.zeros_(p)
+    # ── Encode gloss con encoder custom + bridge ──────────────────────────────
+    def _encode(
+        self,
+        gloss_ids:              Tensor,            # (B, G)
+        gloss_key_padding_mask: Tensor | None,     # (B, G) True=pad
+    ) -> tuple[Tensor, Tensor]:
+        """
+        Ritorna (encoder_hidden_states, encoder_attention_mask):
+          - encoder_hidden_states: (B, G, 1024)  — input per il decoder mBART
+          - encoder_attention_mask: (B, G) long  — 1=token reale, 0=padding
+        """
+        B, G    = gloss_ids.shape
+        device  = gloss_ids.device
 
-    @staticmethod
-    def _make_causal_mask(size: int, device: torch.device) -> Tensor:
-        return torch.triu(
-            torch.ones(size, size, device=device, dtype=torch.bool), diagonal=1
-        )
+        memory      = self.gloss_encoder(gloss_ids, gloss_key_padding_mask)  # (B, G, d_model)
+        memory_proj = self.bridge(memory)                                      # (B, G, 1024)
 
-    # ── Forward (training) ────────────────────
+        if gloss_key_padding_mask is not None:
+            # HF usa 1=reale / 0=pad, inverse rispetto a key_padding_mask (True=pad)
+            enc_attn_mask = (~gloss_key_padding_mask).long()
+        else:
+            enc_attn_mask = torch.ones(B, G, dtype=torch.long, device=device)
+
+        return memory_proj, enc_attn_mask
+
+    # ── Forward (training con teacher forcing) ────────────────────────────────
     def forward(
         self,
-        gloss_ids:               Tensor,               # (B, G)
-        tgt_input:               Tensor,               # (B, L-1)
-        tgt_output:              Tensor,               # (B, L-1)  ← usato per la loss
-        gloss_key_padding_mask:  Tensor | None = None, # (B, G)
-        tgt_in_key_padding_mask: Tensor | None = None, # (B, L-1)
-        return_attn:             bool = False,
+        gloss_ids:              Tensor,            # (B, G)
+        gloss_key_padding_mask: Tensor | None,     # (B, G) True=pad
+        labels:                 Tensor,            # (B, L) -100 su padding
     ) -> tuple:
         """
-        Ritorna:
-            logits: (B, L-1, trans_vocab_size)
-            loss:   scalar CE loss
-            attn:   (B, L-1, G) se return_attn=True, altrimenti None
+        Ritorna (logits, loss, None).
+        loss è calcolata da mBART internamente sulle posizioni != -100.
         """
-        B, G = gloss_ids.shape
-        L    = tgt_input.shape[1]
-        device = gloss_ids.device
+        memory_proj, enc_attn_mask = self._encode(gloss_ids, gloss_key_padding_mask)
 
-        # Encode gloss
-        memory = self.gloss_encoder(gloss_ids, gloss_key_padding_mask)  # (B, G, d_model)
-
-        # Decode
-        causal_mask = self._make_causal_mask(L, device)
-        tgt_emb = self.tgt_embed(tgt_input, tgt_in_key_padding_mask)    # (B, L-1, d_model)
-
-        dec_out, cross_attn = self.decoder(
-            tgt=tgt_emb,
-            memory=memory,
-            tgt_mask=causal_mask,
-            tgt_key_padding_mask=tgt_in_key_padding_mask,
-            memory_key_padding_mask=gloss_key_padding_mask,
-            return_attn=return_attn,
-        )                                                                # (B, L-1, d_model)
-
-        logits = self.output_proj(dec_out)                               # (B, L-1, V)
-
-        # Loss
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            tgt_output.reshape(-1),
-            ignore_index=self.trans_pad_id,
-            label_smoothing=self.label_smoothing,
+        out = self.mbart(
+            encoder_outputs=BaseModelOutput(last_hidden_state=memory_proj),
+            attention_mask=enc_attn_mask,
+            labels=labels,
+            label_smoothing=0.1,
         )
+        return out.logits, out.loss, None
 
-        if return_attn:
-            return logits, loss, cross_attn
-        return logits, loss, None
-
-    # ── Encode gloss ──────────────────────────
-    def encode(
-        self,
-        gloss_ids: Tensor,
-        gloss_key_padding_mask: Tensor | None = None,
-    ) -> Tensor:
-        """Restituisce le rappresentazioni encoder: (B, G, d_model)."""
-        return self.gloss_encoder(gloss_ids, gloss_key_padding_mask)
-
-    # ── Greedy decode ─────────────────────────
+    # ── Generazione autoregressiva ────────────────────────────────────────────
     @torch.no_grad()
-    def greedy_decode(
+    def generate(
         self,
-        gloss_ids:              Tensor,              # (B, G)
-        bos_id:                 int,
-        eos_id:                 int,
-        max_len:                int = 128,
-        gloss_key_padding_mask: Tensor | None = None,
-    ) -> list[list[int]]:
-        device  = gloss_ids.device
-        B       = gloss_ids.size(0)
-        memory  = self.encode(gloss_ids, gloss_key_padding_mask)  # (B, G, d_model)
-
-        ys       = torch.full((B, 1), bos_id, dtype=torch.long, device=device)
-        finished = torch.zeros(B, dtype=torch.bool, device=device)
-        results  = [[] for _ in range(B)]
-
-        for _ in range(max_len):
-            L = ys.size(1)
-            causal  = self._make_causal_mask(L, device)
-            tgt_emb = self.tgt_embed(ys)
-            dec_out, _ = self.decoder(
-                tgt=tgt_emb,
-                memory=memory,
-                tgt_mask=causal,
-                memory_key_padding_mask=gloss_key_padding_mask,
-            )
-            logits  = self.output_proj(dec_out[:, -1, :])   # (B, V)
-            next_id = logits.argmax(dim=-1)                  # (B,)
-
-            for b in range(B):
-                if not finished[b]:
-                    tok = next_id[b].item()
-                    if tok == eos_id:
-                        finished[b] = True
-                    else:
-                        results[b].append(tok)
-
-            if finished.all():
-                break
-            ys = torch.cat([ys, next_id.unsqueeze(1)], dim=1)
-
-        return results
-
-    # ── Beam search ───────────────────────────
-    @torch.no_grad()
-    def beam_search(
-        self,
-        gloss_ids:              Tensor,              # (1, G)
-        bos_id:                 int,
-        eos_id:                 int,
-        beam_size:              int   = 4,
-        max_len:                int   = 128,
+        gloss_ids:              Tensor,
+        gloss_key_padding_mask: Tensor | None,
+        max_new_tokens:         int   = 128,
+        num_beams:              int   = 4,
         length_penalty:         float = 0.6,
-        gloss_key_padding_mask: Tensor | None = None,
-    ) -> list[int]:
-        assert gloss_ids.size(0) == 1
-        device = gloss_ids.device
-        memory = self.encode(gloss_ids, gloss_key_padding_mask)
+    ) -> Tensor:
+        """
+        Genera la traduzione. Greedy con num_beams=1, beam search con >1.
+        """
+        memory_proj, enc_attn_mask = self._encode(gloss_ids, gloss_key_padding_mask)
 
-        beams: list[tuple[float, list[int]]] = [(0.0, [bos_id])]
-        completed: list[tuple[float, list[int]]] = []
-
-        for _ in range(max_len):
-            candidates: list[tuple[float, list[int]]] = []
-            for score, seq in beams:
-                if seq[-1] == eos_id:
-                    completed.append((score, seq))
-                    continue
-                ys = torch.tensor([seq], dtype=torch.long, device=device)
-                causal  = self._make_causal_mask(ys.size(1), device)
-                tgt_emb = self.tgt_embed(ys)
-                dec_out, _ = self.decoder(
-                    tgt=tgt_emb,
-                    memory=memory,
-                    tgt_mask=causal,
-                    memory_key_padding_mask=gloss_key_padding_mask,
-                )
-                log_probs = F.log_softmax(
-                    self.output_proj(dec_out[:, -1, :]), dim=-1
-                )
-                top_logp, top_ids = log_probs.topk(beam_size, dim=-1)
-                for lp, tid in zip(top_logp[0].tolist(), top_ids[0].tolist()):
-                    candidates.append((score + lp, seq + [tid]))
-
-            if not candidates:
-                break
-            candidates.sort(
-                key=lambda x: x[0] / (max(1, len(x[1]) - 1) ** length_penalty),
-                reverse=True,
-            )
-            beams = candidates[:beam_size]
-
-        completed += [(s, seq) for s, seq in beams if seq[-1] != eos_id]
-        if not completed:
-            return []
-        completed.sort(
-            key=lambda x: x[0] / (max(1, len(x[1]) - 1) ** length_penalty),
-            reverse=True,
+        return self.mbart.generate(
+            encoder_outputs=BaseModelOutput(last_hidden_state=memory_proj),
+            attention_mask=enc_attn_mask,
+            forced_bos_token_id=self.forced_bos_token_id,
+            max_new_tokens=max_new_tokens,
+            max_length=None,
+            num_beams=num_beams,
+            length_penalty=length_penalty,
+            early_stopping=(num_beams > 1),
+            repetition_penalty=1.3,
+            no_repeat_ngram_size=3,
         )
-        return [t for t in completed[0][1] if t not in (bos_id, eos_id)]
 
+    # ── Utilità ───────────────────────────────────────────────────────────────
     def num_parameters(self, trainable_only: bool = True) -> int:
         if trainable_only:
             return sum(p.numel() for p in self.parameters() if p.requires_grad)
         return sum(p.numel() for p in self.parameters())
 
+    def print_trainable_parameters(self):
+        enc_params = sum(p.numel() for p in self.gloss_encoder.parameters())
+        bri_params = sum(p.numel() for p in self.bridge.parameters())
+        lora_params = sum(
+            p.numel() for n, p in self.mbart.named_parameters()
+            if p.requires_grad and "model.encoder" not in n
+        )
+        total = self.num_parameters(trainable_only=False)
+        trainable = enc_params + bri_params + lora_params
+        print(
+            f"[HybridGlossToText] Parametri trainable:\n"
+            f"  GlossEncoder : {enc_params:>12,}\n"
+            f"  Bridge       : {bri_params:>12,}\n"
+            f"  mBART LoRA   : {lora_params:>12,}\n"
+            f"  ─────────────────────────────\n"
+            f"  Trainable    : {trainable:>12,}  ({100*trainable/total:.2f}% del totale)\n"
+            f"  Totale       : {total:>12,}"
+        )
 
-# ─────────────────────────────────────────────
-# Pipeline di inferenza a due stadi
-# ─────────────────────────────────────────────
-class TwoStagePipeline(nn.Module):
+    # ── Salvataggio ───────────────────────────────────────────────────────────
+    def save(self, checkpoint_dir: str | Path):
+        """
+        Salva tutti i pesi trainable:
+          - {checkpoint_dir}/encoder_bridge.pt  : GlossEncoder + bridge
+          - {checkpoint_dir}/lora/               : adapter LoRA del decoder mBART
+        """
+        checkpoint_dir = Path(checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        torch.save(
+            {
+                "gloss_encoder": self.gloss_encoder.state_dict(),
+                "bridge":        self.bridge.state_dict(),
+            },
+            checkpoint_dir / "encoder_bridge.pt",
+        )
+        self.mbart.save_pretrained(str(checkpoint_dir / "lora"))
+
+    @classmethod
+    def load(
+        cls,
+        checkpoint_dir:      str | Path,
+        gloss_vocab_size:    int,
+        forced_bos_token_id: int   = None,
+        d_model:             int   = 256,
+        nhead:               int   = 4,
+        num_enc_layers:      int   = 2,
+        dim_feedforward:     int   = 512,
+        dropout:             float = 0.1,
+        max_gloss_len:       int   = 64,
+        gloss_pad_id:        int   = 0,
+        lora_r:              int   = 16,
+        lora_alpha:          int   = 32,
+        lora_dropout:        float = 0.1,
+        lora_target_modules: list  = None,
+    ) -> "HybridGlossToText":
+        """Carica il modello completo da un checkpoint salvato con save()."""
+        checkpoint_dir = Path(checkpoint_dir)
+
+        model = cls(
+            gloss_vocab_size=gloss_vocab_size,
+            d_model=d_model, nhead=nhead, num_enc_layers=num_enc_layers,
+            dim_feedforward=dim_feedforward, dropout=dropout,
+            max_gloss_len=max_gloss_len, gloss_pad_id=gloss_pad_id,
+            lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+            lora_target_modules=lora_target_modules,
+            forced_bos_token_id=forced_bos_token_id,
+            gradient_checkpointing=False,
+        )
+
+        enc_bri = torch.load(checkpoint_dir / "encoder_bridge.pt", map_location="cpu")
+        model.gloss_encoder.load_state_dict(enc_bri["gloss_encoder"])
+        model.bridge.load_state_dict(enc_bri["bridge"])
+
+        # Ricarica mBART base + adapter LoRA
+        base = MBartForConditionalGeneration.from_pretrained(cls.MBART_NAME)
+        model.mbart = PeftModel.from_pretrained(base, str(checkpoint_dir / "lora"))
+
+        return model
+    
+
+
+    def init_gloss_embeddings_from_mbart(self, gloss_tokenizer) -> int:
+        """
+        Copia i pesi embedding di mBART nel GlossEncoder per i token in comune.
+        Le gloss PHOENIX sono parole tedesche uppercase: mBART conosce le loro
+        versioni lowercase, il che fornisce un'inizializzazione semanticamente ricca.
+        Ritorna il numero di token inizializzati con successo.
+        """
+        mbart_tok  = MBartTokenizer.from_pretrained(self.MBART_NAME)
+        # accesso ai pesi embedding del modello base sotto PEFT
+        mbart_emb  = self.mbart.get_input_embeddings().weight.data  # (vocab, 1024)
+
+        # proiezione 1024 → d_model tramite inversa lineare approssimata del bridge
+        with torch.no_grad():
+            bridge_weight = self.bridge[3].weight.data @ self.bridge[0].weight.data
+            proj = torch.linalg.pinv(bridge_weight)  # (d_model, 1024)
+
+        hits = 0
+        with torch.no_grad():
+            for token, idx in gloss_tokenizer.token2idx.items():
+                # prova sia uppercase che lowercase
+                for variant in [token.lower(), token.capitalize(), token]:
+                    mbart_id = mbart_tok.convert_tokens_to_ids(f"▁{variant}")
+                    if mbart_id == mbart_tok.unk_token_id:
+                        mbart_id = mbart_tok.convert_tokens_to_ids(variant)
+                    if mbart_id != mbart_tok.unk_token_id:
+                        src = mbart_emb[mbart_id]          # (1024,)
+                        self.gloss_encoder.embedding.weight.data[idx] = proj @ src
+                        hits += 1
+                        break
+        print(f"[init_embeddings] {hits}/{len(gloss_tokenizer.token2idx)} token inizializzati da mBART")
+        return hits
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline di inferenza a due stadi (versione ibrida)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TwoStagePipelineHybrid(nn.Module):
     """
-    Wrapper di inferenza che concatena Modello 1 e Modello 2.
+    Inferenza completa: landmark → gloss (Modello 1) → tedesco (ibrido).
 
-    NON ha parametri propri: orchestra i due modelli già addestrati.
-    NON viene usato durante il training (i due modelli si allenano separatamente).
+    Modello 1 (SignLanguageTransformer) rimane invariato.
+    Modello 2 è HybridGlossToText.
 
     Args:
-        model1:           SignLanguageTransformer (landmark → gloss)
-        model2:           GlossToTextTransformer (gloss → translation)
-        gloss_tokenizer:  tokenizer usato da Modello 1 (target_field='orth')
-        trans_tokenizer:  tokenizer usato da Modello 2
-                          Se identico a gloss_tokenizer, passare lo stesso oggetto.
-        gloss_bos_id:     bos del vocabolario gloss
-        gloss_eos_id:     eos del vocabolario gloss
-        trans_bos_id:     bos del vocabolario traduzione
-        trans_eos_id:     eos del vocabolario traduzione
+        model1:          SignLanguageTransformer (landmark → gloss)
+        model2:          HybridGlossToText (gloss → traduzione)
+        gloss_tokenizer: SentenceTokenizer del Modello 1
+        mbart_tokenizer: MBartTokenizer (per decodificare l'output)
+        gloss_bos_id:    bos id vocabolario gloss
+        gloss_eos_id:    eos id vocabolario gloss
+        gloss_pad_id:    pad id vocabolario gloss
     """
 
     def __init__(
         self,
         model1:          SignLanguageTransformer,
-        model2:          GlossToTextTransformer,
+        model2:          HybridGlossToText,
         gloss_tokenizer,
-        trans_tokenizer,
+        mbart_tokenizer: MBartTokenizer,
         gloss_bos_id:    int,
         gloss_eos_id:    int,
-        trans_bos_id:    int,
-        trans_eos_id:    int,
         gloss_pad_id:    int = 0,
     ):
         super().__init__()
-        self.model1         = model1
-        self.model2         = model2
-        self.gloss_tok      = gloss_tokenizer
-        self.trans_tok      = trans_tokenizer
-        self.gloss_bos_id   = gloss_bos_id
-        self.gloss_eos_id   = gloss_eos_id
-        self.trans_bos_id   = trans_bos_id
-        self.trans_eos_id   = trans_eos_id
-        self.gloss_pad_id   = gloss_pad_id
+        self.model1       = model1
+        self.model2       = model2
+        self.gloss_tok    = gloss_tokenizer
+        self.mbart_tok    = mbart_tokenizer
+        self.gloss_bos_id = gloss_bos_id
+        self.gloss_eos_id = gloss_eos_id
+        self.gloss_pad_id = gloss_pad_id
 
     @torch.no_grad()
     def forward(
         self,
         src:                  Tensor,              # (B, T, feat_dim)
         src_key_padding_mask: Tensor | None = None,
-        max_gloss_len:        int = 64,
-        max_trans_len:        int = 128,
-        decode_mode:          str = "greedy",      # "greedy" | "beam"
-        beam_size:            int = 4,
+        max_gloss_len:        int   = 64,
+        max_trans_len:        int   = 128,
+        num_beams:            int   = 4,
         length_penalty:       float = 0.6,
     ) -> dict:
-        """
-        Inferenza completa landmark → gloss → translation.
-
-        Ritorna:
-            {
-              "gloss_ids":    list[list[int]],   # token id gloss per campione
-              "gloss_texts":  list[str],          # gloss decodificati
-              "trans_ids":    list[list[int]],   # token id traduzione
-              "trans_texts":  list[str],          # traduzioni finali
-            }
-        """
         device = src.device
-        B = src.size(0)
+        B      = src.size(0)
 
-        # ── Stadio 1: landmark → gloss ────────
+        # ── Stadio 1: landmark → gloss (Modello 1 invariato) ──────────────────
         self.model1.eval()
         gloss_ids_list = self.model1.greedy_decode(
             src=src,
@@ -464,55 +469,33 @@ class TwoStagePipeline(nn.Module):
             eos_id=self.gloss_eos_id,
             max_len=max_gloss_len,
             src_key_padding_mask=src_key_padding_mask,
-        )  # list[list[int]], lunghezza variabile
-
+        )
         gloss_texts = [self.gloss_tok.decode(ids) for ids in gloss_ids_list]
 
-        # ── Padding gloss per Modello 2 ───────
-        # Aggiungi bos/eos e padda al batch
+        # ── Padding gloss con token speciali per il Modello 2 ─────────────────
         gloss_with_special = [
             [self.gloss_bos_id] + ids + [self.gloss_eos_id]
             for ids in gloss_ids_list
         ]
-        max_g = max(len(g) for g in gloss_with_special)
-        gloss_padded = torch.full(
-            (B, max_g), self.gloss_pad_id, dtype=torch.long, device=device
-        )
-        gloss_mask = torch.ones(B, max_g, dtype=torch.bool, device=device)
+        max_g        = max(len(g) for g in gloss_with_special)
+        gloss_padded = torch.full((B, max_g), self.gloss_pad_id, dtype=torch.long, device=device)
+        gloss_mask   = torch.ones(B, max_g, dtype=torch.bool, device=device)
         for i, g in enumerate(gloss_with_special):
-            gloss_padded[i, : len(g)] = torch.tensor(g, dtype=torch.long, device=device)
-            gloss_mask[i, : len(g)] = False   # False = non padding
+            gloss_padded[i, :len(g)] = torch.tensor(g, dtype=torch.long, device=device)
+            gloss_mask[i, :len(g)]   = False
 
-        # ── Stadio 2: gloss → translation ─────
+        # ── Stadio 2: gloss → traduzione (ibrido) ─────────────────────────────
         self.model2.eval()
-        if decode_mode == "beam":
-            # Beam search: un esempio alla volta
-            trans_ids_list = []
-            for i in range(B):
-                ids = self.model2.beam_search(
-                    gloss_ids=gloss_padded[i : i + 1],
-                    bos_id=self.trans_bos_id,
-                    eos_id=self.trans_eos_id,
-                    beam_size=beam_size,
-                    max_len=max_trans_len,
-                    length_penalty=length_penalty,
-                    gloss_key_padding_mask=gloss_mask[i : i + 1],
-                )
-                trans_ids_list.append(ids)
-        else:
-            trans_ids_list = self.model2.greedy_decode(
-                gloss_ids=gloss_padded,
-                bos_id=self.trans_bos_id,
-                eos_id=self.trans_eos_id,
-                max_len=max_trans_len,
-                gloss_key_padding_mask=gloss_mask,
-            )
-
-        trans_texts = [self.trans_tok.decode(ids) for ids in trans_ids_list]
+        generated = self.model2.generate(
+            gloss_ids=gloss_padded,
+            gloss_key_padding_mask=gloss_mask,
+            max_new_tokens=max_trans_len,
+            num_beams=num_beams,
+            length_penalty=length_penalty,
+        )
+        trans_texts = self.mbart_tok.batch_decode(generated, skip_special_tokens=True)
 
         return {
-            "gloss_ids":   gloss_ids_list,
             "gloss_texts": gloss_texts,
-            "trans_ids":   trans_ids_list,
             "trans_texts": trans_texts,
         }

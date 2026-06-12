@@ -22,14 +22,14 @@ Utilizzo:
 
   # Valuta solo il Modello 2 (con gloss gold)
   python evaluate.py --mode stage2 \
-    --stage2_checkpoint outputs/phoenix_stage2/best.pt \
+      --stage2_dir       outputs/phoenix_stage2_hybrid \
     --val_csv           dataset/PHOENIX-2014-T.dev.corpus.csv \
     --stage1_dir        outputs/phoenix_run1
 
   # Valuta la pipeline completa
   python evaluate.py --mode pipeline \
     --checkpoint        outputs/phoenix_run1/best.pt \
-    --stage2_checkpoint outputs/phoenix_stage2/best.pt \
+        --stage2_dir       outputs/phoenix_stage2_hybrid \
     --val_csv           dataset/PHOENIX-2014-T.dev.corpus.csv \
     --landmarks_dir     dataset/landmarks_dev \
     --train_csv         dataset/PHOENIX-2014-T.train.corpus.csv \
@@ -57,7 +57,8 @@ from .data.phoenix_loader import (
     build_tokenizer,
 )
 from .models.transformer import SignLanguageTransformer
-from .two_stage import GlossToTextTransformer
+from transformers import MBartTokenizer
+from .two_stage import HybridGlossToText
 from .bleu import compute_bleu as _phoenix_compute_bleu
 from .rouge import rouge as _phoenix_rouge
 
@@ -261,6 +262,36 @@ def _load_tokenizer(cfg: dict, tok_path: str | Path | None = None,
     raise ValueError("Tokenizer non trovato.")
 
 
+def _load_mbart_tokenizer() -> MBartTokenizer:
+    return MBartTokenizer.from_pretrained(
+        HybridGlossToText.MBART_NAME,
+        src_lang="de_DE",
+        tgt_lang="de_DE",
+    )
+
+
+def _resolve_hybrid_stage2_paths(cfg: dict) -> tuple[Path, Path]:
+    stage2_dir = Path(cfg.get("stage2_dir", "outputs/phoenix_stage2_hybrid"))
+    checkpoint_dir = Path(cfg["stage2_checkpoint"]) if cfg.get("stage2_checkpoint") else None
+    meta_path = Path(cfg["stage2_meta"]) if cfg.get("stage2_meta") else None
+
+    if checkpoint_dir is None:
+        checkpoint_dir = stage2_dir / "best"
+
+    if checkpoint_dir.is_file():
+        checkpoint_dir = checkpoint_dir.parent
+
+    if meta_path is None:
+        meta_path = checkpoint_dir.parent / "best_meta.pt"
+
+    if not meta_path.exists():
+        raise FileNotFoundError(f"Meta checkpoint hybrid non trovato: {meta_path}")
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"Checkpoint hybrid non trovato: {checkpoint_dir}")
+
+    return checkpoint_dir, meta_path
+
+
 def _resolve_model_cfg(cli_cfg: dict, ckpt_cfg: dict) -> dict:
     def _pick(key, default):
         return cli_cfg[key] if cli_cfg.get(key) is not None else ckpt_cfg.get(key, default)
@@ -398,39 +429,56 @@ def _build_model1(cfg: dict, device: torch.device, gloss_tokenizer: SentenceToke
 # ─────────────────────────────────────────────────────────────
 
 def _build_model2(cfg: dict, device: torch.device,
-                  gloss_tokenizer: SentenceTokenizer,
-                  trans_tokenizer: SentenceTokenizer):
-    ckpt_path  = _resolve_checkpoint_path(cfg, key="stage2_checkpoint",
-                                          default_dir_key="stage2_dir",
-                                          default_dir="outputs/phoenix_stage2")
-    ckpt       = _load_checkpoint(ckpt_path, device)
-    ckpt_cfg   = ckpt.get("cfg", {})
-    state_dict = ckpt.get("model") or ckpt.get("model_state_dict") or ckpt
+                  gloss_tokenizer: SentenceTokenizer):
+    checkpoint_dir, meta_path = _resolve_hybrid_stage2_paths(cfg)
+    meta = _load_checkpoint(meta_path, device)
 
-    def _pick(key, default):
-        return cfg.get(key) or ckpt_cfg.get(key, default)
+    forced_bos_token_id = meta.get("forced_bos_token_id")
+    if forced_bos_token_id is None:
+        raise KeyError(f"forced_bos_token_id mancante in {meta_path}")
 
-    model = GlossToTextTransformer(
+    stage_cfg = meta.get("cfg", {})
+    model = HybridGlossToText.load(
+        checkpoint_dir=checkpoint_dir,
         gloss_vocab_size=gloss_tokenizer.vocab_size,
-        trans_vocab_size=trans_tokenizer.vocab_size,
-        d_model=       _pick("s2_d_model",        256),
-        nhead=         _pick("s2_nhead",           4),
-        num_enc_layers=_pick("s2_num_enc_layers",  2),
-        num_dec_layers=_pick("s2_num_dec_layers",  2),
-        dim_feedforward=_pick("s2_dim_feedforward",512),
-        dropout=       _pick("s2_dropout",         0.1),
-        max_gloss_len= _pick("max_gloss_len",      64),
-        max_trans_len= _pick("max_trans_len",       128),
-        gloss_pad_id=  gloss_tokenizer.pad_id,
-        trans_pad_id=  trans_tokenizer.pad_id,
-        label_smoothing=_pick("label_smoothing",   0.1),
+        forced_bos_token_id=forced_bos_token_id,
+        d_model=stage_cfg.get("d_model", 256),
+        nhead=stage_cfg.get("nhead", 4),
+        num_enc_layers=stage_cfg.get("num_enc_layers", 2),
+        dim_feedforward=stage_cfg.get("dim_feedforward", 512),
+        dropout=stage_cfg.get("dropout", 0.1),
+        max_gloss_len=stage_cfg.get("max_gloss_len", 64),
+        gloss_pad_id=gloss_tokenizer.pad_id,
+        lora_r=stage_cfg.get("lora_r", 16),
+        lora_alpha=stage_cfg.get("lora_alpha", 32),
+        lora_dropout=stage_cfg.get("lora_dropout", 0.1),
+        lora_target_modules=stage_cfg.get("lora_target_modules", ["q_proj", "v_proj"]),
     ).to(device)
-
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing or unexpected:
-        print(f"[EVAL] Stage2 non-strict load — missing: {missing} | unexpected: {unexpected}")
     model.eval()
-    return model
+    return model, meta
+
+
+def _encode_gloss_batch(
+    gloss_texts: list[str],
+    gloss_tokenizer: SentenceTokenizer,
+    device: torch.device,
+    max_gloss_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    gloss_ids_list = [
+        gloss_tokenizer.encode(text, add_special_tokens=True)
+        for text in gloss_texts
+    ]
+    gloss_ids_list = [
+        ids[: max_gloss_len - 1] + [gloss_tokenizer.eos_id] if len(ids) > max_gloss_len else ids
+        for ids in gloss_ids_list
+    ]
+    max_len = max(len(ids) for ids in gloss_ids_list)
+    gloss_ids = torch.full((len(gloss_ids_list), max_len), gloss_tokenizer.pad_id, dtype=torch.long, device=device)
+    gloss_mask = torch.ones(len(gloss_ids_list), max_len, dtype=torch.bool, device=device)
+    for index, ids in enumerate(gloss_ids_list):
+        gloss_ids[index, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+        gloss_mask[index, :len(ids)] = False
+    return gloss_ids, gloss_mask
 
 
 # ─────────────────────────────────────────────────────────────
@@ -532,31 +580,20 @@ def evaluate_stage2(cfg: dict) -> dict:
     Rappresenta l'upper bound del sistema: quanto bene può tradurre
     il Modello 2 se il Modello 1 fosse perfetto.
     """
-    import csv as _csv
-    from functools import partial as _partial
-
     device  = torch.device(cfg["device"] if torch.cuda.is_available() else "cpu")
     use_amp = cfg.get("use_amp", False) and device.type == "cuda"
 
-    # Tokenizer gloss
-    stage1_dir     = Path(cfg.get("stage1_dir", "outputs/phoenix_run1"))
-    gloss_tok_path = stage1_dir / "tokenizer.json"
-    gloss_tokenizer = _load_tokenizer(cfg, tok_path=gloss_tok_path, target_field="orth")
-
-    # Tokenizer traduzione
-    stage2_dir     = Path(cfg.get("stage2_dir", "outputs/phoenix_stage2"))
-    trans_tok_path = stage2_dir / "tokenizer_trans.json"
-    trans_tokenizer = _load_tokenizer(cfg, tok_path=trans_tok_path, target_field="translation")
-
-    print(f"[EVAL/S2] Tokenizer gloss: {gloss_tokenizer.vocab_size} | "
-          f"trans: {trans_tokenizer.vocab_size}")
-
-    model2 = _build_model2(cfg, device, gloss_tokenizer, trans_tokenizer)
+    stage1_dir      = Path(cfg.get("stage1_dir", "outputs/phoenix_run1"))
+    gloss_tokenizer = _load_tokenizer(cfg, tok_path=stage1_dir / "tokenizer.json", target_field="orth")
+    mbart_tokenizer  = _load_mbart_tokenizer()
+    model2, meta = _build_model2(cfg, device, gloss_tokenizer)
+    max_gloss_len = meta.get("cfg", {}).get("max_gloss_len", 64)
+    max_trans_len = meta.get("cfg", {}).get("max_trans_len", 128)
 
     # Legge le coppie (orth, translation) direttamente dal CSV
     pairs: list[dict] = []
     with open(cfg["val_csv"], newline="", encoding="utf-8") as f:
-        reader = _csv.DictReader(f, delimiter="|")
+        reader = csv.DictReader(f, delimiter="|")
         for row in reader:
             orth  = row.get("orth",        "").strip()
             trans = row.get("translation", "").strip()
@@ -570,30 +607,18 @@ def evaluate_stage2(cfg: dict) -> dict:
     batch_size = cfg["batch_size"]
     for start in range(0, len(pairs), batch_size):
         batch_pairs = pairs[start : start + batch_size]
-        B = len(batch_pairs)
 
-        # Tokenizza gloss
-        gloss_encoded = [
-            gloss_tokenizer.encode(p["orth"], add_special_tokens=True)
-            for p in batch_pairs
-        ]
-        max_g = max(len(g) for g in gloss_encoded)
-        gloss_padded = torch.full((B, max_g), gloss_tokenizer.pad_id, dtype=torch.long, device=device)
-        gloss_mask   = torch.ones(B, max_g, dtype=torch.bool, device=device)
-        for i, g in enumerate(gloss_encoded):
-            gloss_padded[i, :len(g)] = torch.tensor(g, dtype=torch.long)
-            gloss_mask[i, :len(g)] = False
+        gloss_texts = [p["orth"] for p in batch_pairs]
+        gloss_ids, gloss_mask = _encode_gloss_batch(gloss_texts, gloss_tokenizer, device, max_gloss_len)
 
-        with torch.no_grad():
-            hyps = model2.greedy_decode(
-                gloss_ids=gloss_padded,
-                bos_id=trans_tokenizer.bos_id,
-                eos_id=trans_tokenizer.eos_id,
-                max_len=cfg["max_decode_len"],
-                gloss_key_padding_mask=gloss_mask,
-            )
+        generated = model2.generate(
+            gloss_ids=gloss_ids,
+            gloss_key_padding_mask=gloss_mask,
+            max_new_tokens=max_trans_len,
+        )
+        hyps = mbart_tokenizer.batch_decode(generated, skip_special_tokens=True)
 
-        all_hyps.extend(decode_batch(hyps, trans_tokenizer))
+        all_hyps.extend(hyps)
         all_refs.extend(p["translation"] for p in batch_pairs)
 
         if (start // batch_size + 1) % 20 == 0:
@@ -634,18 +659,15 @@ def evaluate_pipeline(cfg: dict) -> dict:
 
     # Tokenizer
     stage1_dir      = Path(cfg.get("stage1_dir", "outputs/phoenix_run1"))
-    stage2_dir      = Path(cfg.get("stage2_dir", "outputs/phoenix_stage2"))
     gloss_tokenizer = _load_tokenizer(cfg, tok_path=stage1_dir / "tokenizer.json",
                                       target_field="orth")
-    trans_tokenizer = _load_tokenizer(cfg, tok_path=stage2_dir / "tokenizer_trans.json",
-                                      target_field="translation")
-    print(f"[EVAL/PL] Tokenizer gloss: {gloss_tokenizer.vocab_size} | "
-          f"trans: {trans_tokenizer.vocab_size}")
+    mbart_tokenizer = _load_mbart_tokenizer()
 
     # Costruzione modelli
     model1, model_cfg, ckpt_cfg = _build_model1(cfg, device, gloss_tokenizer)
-    model2 = _build_model2(cfg, device, gloss_tokenizer, trans_tokenizer)
+    model2, stage2_meta = _build_model2(cfg, device, gloss_tokenizer)
     data_weights = _resolve_data_weights(cfg, ckpt_cfg)
+    max_trans_len = stage2_meta.get("cfg", {}).get("max_trans_len", cfg["max_decode_len"])
 
     # Stats normalizzazione per il Modello 1
     normalize_stats = None
@@ -717,30 +739,22 @@ def evaluate_pipeline(cfg: dict) -> dict:
         all_gloss_hyps.extend(gloss_texts)
         all_gloss_refs.extend(batch["targets"])   # gloss gold
 
-        # ── Padda gloss per Modello 2 ─────────
-        gloss_with_special = [
-            [gloss_tokenizer.bos_id] + ids + [gloss_tokenizer.eos_id]
-            for ids in gloss_ids_list
-        ]
-        max_g = max(len(g) for g in gloss_with_special)
-        gloss_padded = torch.full((B, max_g), gloss_tokenizer.pad_id,
-                                  dtype=torch.long, device=device)
-        gloss_mask2  = torch.ones(B, max_g, dtype=torch.bool, device=device)
-        for i, g in enumerate(gloss_with_special):
-            gloss_padded[i, :len(g)] = torch.tensor(g, dtype=torch.long, device=device)
-            gloss_mask2[i, :len(g)] = False
-
         # ── Stadio 2: gloss → translation ─────
         with torch.no_grad():
-            trans_ids_list = model2.greedy_decode(
-                gloss_ids=gloss_padded,
-                bos_id=trans_tokenizer.bos_id,
-                eos_id=trans_tokenizer.eos_id,
-                max_len=cfg["max_decode_len"],
-                gloss_key_padding_mask=gloss_mask2,
+            gloss_ids, gloss_mask = _encode_gloss_batch(
+                gloss_texts,
+                gloss_tokenizer,
+                device,
+                stage2_meta.get("cfg", {}).get("max_gloss_len", 64),
             )
 
-        all_trans_hyps.extend(decode_batch(trans_ids_list, trans_tokenizer))
+            generated = model2.generate(
+                gloss_ids=gloss_ids,
+                gloss_key_padding_mask=gloss_mask,
+                max_new_tokens=max_trans_len,
+            )
+
+        all_trans_hyps.extend(mbart_tokenizer.batch_decode(generated, skip_special_tokens=True))
         all_trans_refs.extend(
             trans_gold.get(name, "") for name in names
         )
@@ -793,9 +807,13 @@ def main():
 
     # Modello 2
     parser.add_argument("--stage2_checkpoint",    type=str, default=None,
-                        help="Checkpoint Modello 2 (gloss→translation)")
-    parser.add_argument("--stage2_dir",           type=str, default="outputs/phoenix_stage2",
-                        help="Dir output Stage 2 (per tokenizer translation)")
+                        help="Checkpoint dir Stage 2 ibrido (es. outputs/.../best)")
+    parser.add_argument("--stage2_meta",          type=str, default=None,
+                        help="Meta checkpoint Stage 2 ibrido (best_meta.pt)")
+    parser.add_argument("--stage2_lora_dir",      type=str, default=None,
+                        help="Compat legacy: ignorato dal modello ibrido")
+    parser.add_argument("--stage2_dir",           type=str, default="outputs/phoenix_stage2_hybrid",
+                        help="Dir output Stage 2 ibrido")
 
     # Dataset
     parser.add_argument("--val_csv",              type=str,
