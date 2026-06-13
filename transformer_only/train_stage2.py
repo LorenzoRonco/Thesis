@@ -320,7 +320,7 @@ def main():
         # ── Training ──────────────────────────────────────────────────────────
         # LR molto più bassa rispetto al training from scratch: mBART è già
         # pre-addestrato, vogliamo solo adattarlo al task gloss→tedesco.
-        "epochs":              150,
+        "epochs":              200,
         "batch_size":          4,      # batch fisico per GPU da 11 GB
         "grad_accum_steps":    8,      # batch effettivo = 4 × 8 = 32
         "lr":                  3e-5,
@@ -494,11 +494,12 @@ def main():
 
     # total_steps conta gli step dell'optimizer (ogni grad_accum_steps batch)
     total_steps = (cfg["epochs"] * len(train_loader)) // cfg["grad_accum_steps"]
-    scheduler   = WarmupCosineScheduler(
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        warmup_steps=cfg["warmup_steps"],
-        total_steps=total_steps,
-        min_lr_ratio=0.05,
+        mode="max",        # massimizza BLEU
+        factor=0.7,        # riduci LR del 30%
+        patience=5,        # dopo 5 epoche senza miglioramento
+        min_lr=1e-7,
     )
     scaler = GradScaler(enabled=cfg["use_amp"])
 
@@ -545,7 +546,6 @@ def main():
                 )
                 scaler.step(optimizer)
                 scaler.update()
-                scheduler.step()
                 optimizer.zero_grad()
 
             # Tracking loss (usiamo loss × grad_accum per tornare al valore reale)
@@ -562,7 +562,6 @@ def main():
             )
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
             optimizer.zero_grad()
 
         avg_loss = total_loss / max(1, total_tok)
@@ -587,6 +586,7 @@ def main():
                 f"val_loss={val_stats['loss']:.4f} val_ppl={val_stats['ppl']:.2f} "
                 f"val_bleu={val_stats['bleu']:.2f} ({stage_label}, ogni {val_interval} ep)"
             )
+            scheduler.step(val_stats["bleu"])
 
             if val_stats["bleu"] > best_bleu:
                 best_bleu  = val_stats["bleu"]
