@@ -312,7 +312,7 @@ def main():
         "max_trans_len":   128,
 
         # Training
-        "epochs":       80,
+        "epochs":       60,
         "batch_size":   64,
         "lr":           1e-3,
         "weight_decay": 1e-4,

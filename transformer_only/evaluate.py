@@ -494,13 +494,16 @@ def evaluate_stage1(cfg: dict) -> dict:
         src      = batch["src"].to(device, non_blocking=True)
         src_mask = batch["src_key_padding_mask"].to(device, non_blocking=True)
 
-        hyps = model.greedy_decode(
-            src=src,
-            bos_id=gloss_tokenizer.bos_id,
-            eos_id=gloss_tokenizer.eos_id,
-            max_len=cfg["max_decode_len"],
-            src_key_padding_mask=src_mask,
-        )
+        hyps = []
+        for i in range(src.size(0)):
+            src_i    = src[i:i+1]
+            mask_i   = src_key_padding_mask[i:i+1] if src_key_padding_mask is not None else None
+            best_ids = model.beam_search(src_i, bos_id, eos_id,
+                                        beam_size=4, max_len=128,
+                                        length_penalty=1.5,  # >1 penalizza sequenze lunghe → meno inserzioni
+                                        src_key_padding_mask=mask_i)
+        hyps.append(best_ids)
+        
         all_hyps.extend(decode_batch(hyps, gloss_tokenizer))
         all_refs.extend(batch["targets"])
 
@@ -705,13 +708,20 @@ def evaluate_pipeline(cfg: dict) -> dict:
 
         # ── Stadio 1: landmark → gloss ────────
         with torch.no_grad():
-            gloss_ids_list = model1.greedy_decode(
-                src=src,
-                bos_id=gloss_tokenizer.bos_id,
-                eos_id=gloss_tokenizer.eos_id,
-                max_len=cfg["max_decode_len"],
-                src_key_padding_mask=src_mask,
-            )
+            gloss_ids_list = []
+            for i in range(B):
+                src_i  = src[i:i+1]
+                mask_i = src_mask[i:i+1] if src_mask is not None else None
+                best   = model1.beam_search(
+                    src_i,
+                    gloss_tokenizer.bos_id,
+                    gloss_tokenizer.eos_id,
+                    beam_size=4,
+                    max_len=cfg["max_decode_len"],
+                    length_penalty=1.5,  # penalizza sequenze lunghe → meno inserzioni
+                    src_key_padding_mask=mask_i,
+                )
+                gloss_ids_list.append(best)
 
         gloss_texts = decode_batch(gloss_ids_list, gloss_tokenizer)
         all_gloss_hyps.extend(gloss_texts)
@@ -732,13 +742,31 @@ def evaluate_pipeline(cfg: dict) -> dict:
 
         # ── Stadio 2: gloss → translation ─────
         with torch.no_grad():
-            trans_ids_list = model2.greedy_decode(
-                gloss_ids=gloss_padded,
-                bos_id=trans_tokenizer.bos_id,
-                eos_id=trans_tokenizer.eos_id,
-                max_len=cfg["max_decode_len"],
-                gloss_key_padding_mask=gloss_mask2,
-            )
+            if hasattr(model2, "generate"):
+                # HybridGlossToText: usa beam search nativo di mBART
+                trans_ids_list = model2.generate(
+                    gloss_ids=gloss_padded,
+                    gloss_key_padding_mask=gloss_mask2,
+                    max_new_tokens=cfg["max_decode_len"],
+                    num_beams=4,
+                    length_penalty=0.6,
+                )
+            else:
+                # GlossToTextTransformer custom: beam search manuale
+                trans_ids_list = []
+                for i in range(B):
+                    gp_i = gloss_padded[i:i+1]
+                    gm_i = gloss_mask2[i:i+1]
+                    best = model2.beam_search(
+                        gp_i,
+                        trans_tokenizer.bos_id,
+                        trans_tokenizer.eos_id,
+                        beam_size=4,
+                        max_len=cfg["max_decode_len"],
+                        length_penalty=0.6,
+                        gloss_key_padding_mask=gm_i,
+                    )
+                    trans_ids_list.append(best)
 
         all_trans_hyps.extend(decode_batch(trans_ids_list, trans_tokenizer))
         all_trans_refs.extend(

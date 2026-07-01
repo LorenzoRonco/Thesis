@@ -32,6 +32,7 @@ REPO_ROOT = Path(__file__).parent.absolute()
 sys.path.insert(0, str(REPO_ROOT))
 
 import torch
+from torch import Tensor
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.amp import GradScaler, autocast
@@ -216,6 +217,65 @@ def _compute_loss(
     return _LossOutputs(loss=total_loss, ce_loss=ce_loss, ctc_loss=ctc_loss)
 
 
+def augment_landmarks(
+    src: Tensor,                  # (B, T, 376)
+    src_key_padding_mask: Tensor, # (B, T) True=pad
+    noise_std: float   = 0.005,
+    speed_min: float   = 0.8,
+    speed_max: float   = 1.2,
+    frame_drop: float  = 0.05,
+    hflip_prob: float  = 0.5,
+) -> Tensor:
+    B, T, feat_dim = src.shape
+    out = src.clone()
+
+    for b in range(B):
+        # Identifica i frame reali (non padding)
+        real_len = int((~src_key_padding_mask[b]).sum().item())
+        if real_len == 0:
+            continue
+        seq = out[b, :real_len]   # (real_len, 376)
+
+        # 1. Rumore gaussiano (simula jitter di MediaPipe)
+        if noise_std > 0:
+            seq = seq + torch.randn_like(seq) * noise_std
+
+        # 2. Frame dropout casuale (simula occlusioni brevi)
+        if frame_drop > 0 and real_len > 4:
+            keep = torch.rand(real_len, device=src.device) > frame_drop
+            # garantisci almeno metà dei frame
+            if keep.sum() >= real_len // 2:
+                seq = seq[keep]
+                real_len = seq.size(0)
+
+        # 3. Speed perturbation (resample temporale con interpolazione)
+        if speed_min < 1.0 or speed_max > 1.0:
+            factor    = random.uniform(speed_min, speed_max)
+            new_len   = max(2, min(T, int(round(real_len / factor))))
+            # interpolazione 1D: (1, F, real_len) → (1, F, new_len)
+            seq = F.interpolate(
+                seq.T.unsqueeze(0),       # (1, F, real_len)
+                size=new_len,
+                mode="linear",
+                align_corners=False,
+            ).squeeze(0).T               # (new_len, F)
+            real_len = new_len
+
+        # 4. Flip orizzontale (scambia mano sinistra ↔ destra)
+        # I landmark x sono normalizzati in [0,1]: x_flip = 1 - x
+        # Le coordinate x occupano i canali 0, 4, 8, ... (ogni landmark ha 4 valori: x,y,z,vis)
+        if random.random() < hflip_prob:
+            seq = seq.clone()
+            seq[:, 0::4] = 1.0 - seq[:, 0::4]   # flip coordinata x
+
+        # Rimetti in out con zero-padding se più corto
+        out[b] = 0.0
+        copy_len = min(real_len, T)
+        out[b, :copy_len] = seq[:copy_len]
+
+    return out
+
+
 def train_epoch(
     model: torch.nn.Module,
     loader: torch.utils.data.DataLoader,
@@ -229,6 +289,11 @@ def train_epoch(
     gal_weight: float = 0.0,
     gal_sigma: float = 0.0,
     lambda_ctc: float = 0.0,
+    aug_noise_std: float = 0.0,
+    aug_speed_min: float = 1.0,
+    aug_speed_max: float = 1.0,
+    aug_frame_drop: float = 0.0,
+    aug_hflip_prob: float = 0.0,
 ) -> dict[str, float]:
     device = torch.device(device)
     model.train()
@@ -243,6 +308,16 @@ def train_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         with torch.cuda.amp.autocast(enabled=use_amp):
+            if aug_noise_std > 0 or aug_frame_drop > 0 or aug_hflip_prob > 0:
+                batch["src"] = augment_landmarks(
+                    batch["src"],
+                    batch["src_key_padding_mask"],
+                    noise_std=aug_noise_std,
+                    speed_min=aug_speed_min,
+                    speed_max=aug_speed_max,
+                    frame_drop=aug_frame_drop,
+                    hflip_prob=aug_hflip_prob,
+                )
             logits = model(
                 src=batch["src"],
                 tgt_input=batch["tgt_input"],
@@ -394,25 +469,32 @@ def main():
         "feat_dim":        376,   # 94 landmark × 4
         "d_model":         512,
         "nhead":           8,
-        "num_enc_layers":  3,
+        "num_enc_layers":  6,   # era 3: più layer = più capacità per pattern temporali complessi
         "num_dec_layers":  3,
-        "dim_feedforward": 1024,
+        "dim_feedforward": 2048,  # era 1024: allineato a d_model×4 (standard transformer)
         "dropout":         0.3,
         "label_smoothing": 0.1,
         "max_src_len":     256,
         "max_tgt_len":     128,
         "src_embedding_type": "temporal_cnn",
-        "temporal_kernel_size": 3,
-        "temporal_blocks":      1,
+        "temporal_kernel_size": 5,
+        "temporal_blocks":      3,
 
         # Training
-        "epochs":       300,
+        "epochs":       275,
         "batch_size":   32,
         "lr":           5e-4,
         "weight_decay": 1e-4,
         "clip_norm":    1.0,
         "warmup_steps": 4000,
         "num_workers":  4,
+
+        # Augmentation: aggiungi questo blocco al cfg
+        "aug_noise_std":       0.005,  # rumore gaussiano sui landmark
+        "aug_speed_min":       0.8,    # speed perturbation 0.8×–1.2×
+        "aug_speed_max":       1.2,
+        "aug_frame_drop_prob": 0.05,   # 5% frame drop
+        "aug_hflip_prob":      0.5,    # flip orizzontale (specchia le mani)
 
         # Pesi per gruppo di landmark
         "pose_weight": 0.8,
@@ -428,7 +510,7 @@ def main():
         # Loss ausiliarie
         "gal_weight":  10.0,
         "gal_sigma":   0.25,
-        "lambda_ctc":  0.3,
+        "lambda_ctc":  0.7,   # era 0.3: CTC più forte riduce le inserzioni (WER>100%)
 
         # Subset (None = tutto il dataset)
         "train_subset_fraction": None,
@@ -631,6 +713,11 @@ def main():
             gal_weight=cfg["gal_weight"],
             gal_sigma=cfg["gal_sigma"],
             lambda_ctc=cfg["lambda_ctc"],
+            aug_noise_std=cfg.get("aug_noise_std", 0.0),
+            aug_speed_min=cfg.get("aug_speed_min", 1.0),
+            aug_speed_max=cfg.get("aug_speed_max", 1.0),
+            aug_frame_drop=cfg.get("aug_frame_drop_prob", 0.0),
+            aug_hflip_prob=cfg.get("aug_hflip_prob", 0.0),
         )
 
         # Frequenza di validazione adattiva

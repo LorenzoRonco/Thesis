@@ -414,7 +414,7 @@ class SignLanguageTransformer(nn.Module):
         max_src_len:    int   = 1024,
         max_tgt_len:    int   = 256,
         pad_id:         int   = 0,
-        label_smoothing: float = 0.3,
+        label_smoothing: float = 0.1,   # era 0.3: più alto confonde la predizione di EOS → più inserzioni
         src_embedding_type: str = "mlp",
         temporal_kernel_size: int = 5,
         temporal_blocks: int = 3,
