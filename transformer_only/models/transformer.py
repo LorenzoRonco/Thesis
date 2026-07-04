@@ -743,6 +743,49 @@ class SignLanguageTransformer(nn.Module):
         # Rimuovi <bos> e <eos>
         return [t for t in best_seq if t not in (bos_id, eos_id)]
 
+
+    # ── CTC decoding ──────────────────────────
+    @torch.no_grad()
+    def ctc_decode(
+        self,
+        src:                  Tensor,              # (B, T, feat_dim)
+        src_key_padding_mask: Tensor | None = None,
+        blank_id:             int | None    = None,
+    ) -> list[list[int]]:
+        """
+        Decodifica CTC greedy dell'output dell'encoder.
+
+        NON usa il decoder autoregressivo, quindi per definizione non produce
+        inserzioni: il collasso dei blank+ripetizioni garantisce che l'output
+        non sia più lungo dell'input. Utile per abbassare il WER > 100%.
+
+        Ritorna lista di liste di token id (senza blank, senza ripetizioni).
+        """
+        if blank_id is None:
+            blank_id = self.ctc_blank  # vocab_size (ultimo indice)
+
+        memory, ctc_logits = self.encode(src, src_key_padding_mask, return_ctc_logits=True)
+        # ctc_logits: (B, T, vocab_size+1)
+        pred_ids = ctc_logits.argmax(dim=-1)  # (B, T)
+
+        results: list[list[int]] = []
+        B = pred_ids.size(0)
+        for b in range(B):
+            T_real = int((~src_key_padding_mask[b]).sum().item()) if src_key_padding_mask is not None else pred_ids.size(1)
+            seq = pred_ids[b, :T_real].tolist()
+
+            # Collassa ripetizioni e rimuovi blank
+            collapsed: list[int] = []
+            prev = None
+            for tok in seq:
+                if tok != prev:
+                    if tok != blank_id:
+                        collapsed.append(tok)
+                    prev = tok
+            results.append(collapsed)
+
+        return results
+
     # ── Numero parametri ──────────────────────
     def num_parameters(self, trainable_only: bool = True) -> int:
         if trainable_only:

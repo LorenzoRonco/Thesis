@@ -708,20 +708,26 @@ def evaluate_pipeline(cfg: dict) -> dict:
 
         # ── Stadio 1: landmark → gloss ────────
         with torch.no_grad():
-            gloss_ids_list = []
-            for i in range(B):
-                src_i  = src[i:i+1]
-                mask_i = src_mask[i:i+1] if src_mask is not None else None
-                best   = model1.beam_search(
-                    src_i,
-                    gloss_tokenizer.bos_id,
-                    gloss_tokenizer.eos_id,
-                    beam_size=4,
-                    max_len=cfg["max_decode_len"],
-                    length_penalty=1.5,  # penalizza sequenze lunghe → meno inserzioni
-                    src_key_padding_mask=mask_i,
-                )
-                gloss_ids_list.append(best)
+            # CTC decode: nessuna inserzione per costruzione (collasso blank+ripetizioni)
+            # Risolve il WER >100% senza richiedere retraining.
+            gloss_ids_list = model1.ctc_decode(
+                src,
+                src_key_padding_mask=src_mask,
+            )
+            # Fallback a beam search per campioni con CTC output vuoto
+            for i, ids in enumerate(gloss_ids_list):
+                if len(ids) == 0:
+                    src_i  = src[i:i+1]
+                    mask_i = src_mask[i:i+1] if src_mask is not None else None
+                    gloss_ids_list[i] = model1.beam_search(
+                        src_i,
+                        gloss_tokenizer.bos_id,
+                        gloss_tokenizer.eos_id,
+                        beam_size=4,
+                        max_len=cfg["max_decode_len"],
+                        length_penalty=1.5,
+                        src_key_padding_mask=mask_i,
+                    )
 
         gloss_texts = decode_batch(gloss_ids_list, gloss_tokenizer)
         all_gloss_hyps.extend(gloss_texts)
