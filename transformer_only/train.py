@@ -23,8 +23,13 @@ Fix applicati rispetto alla versione originale:
 import os
 import sys
 import json
+import csv
 import random
 from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 os.environ.setdefault("MPLBACKEND", "Agg")
 
@@ -42,10 +47,16 @@ from dataclasses import dataclass
 from typing import Any
 import torch.nn.functional as F
 
-from .data.phoenix_loader import build_tokenizer, build_dataloaders, SentenceTokenizer
-from .models.transformer import SignLanguageTransformer
-from .bleu import compute_bleu as _phoenix_compute_bleu
-from .attention_visualizer import run_attention_visualization_on_loader
+try:
+    from .data.phoenix_loader import build_tokenizer, build_dataloaders, SentenceTokenizer
+    from .models.transformer import SignLanguageTransformer
+    from .bleu import compute_bleu as _phoenix_compute_bleu
+    from .attention_visualizer import run_attention_visualization_on_loader
+except ImportError:  # pragma: no cover - fallback for direct script execution
+    from transformer_only.data.phoenix_loader import build_tokenizer, build_dataloaders, SentenceTokenizer
+    from transformer_only.models.transformer import SignLanguageTransformer
+    from transformer_only.bleu import compute_bleu as _phoenix_compute_bleu
+    from transformer_only.attention_visualizer import run_attention_visualization_on_loader
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -162,6 +173,65 @@ def _compute_bleu_scores(predictions: list[str], references: list[str]) -> dict[
 
     results["bleu"] = results["bleu_4"]
     return results
+
+
+def save_epoch_history(output_dir: str | Path, history: list[dict[str, Any]], prefix: str = "epoch_metrics") -> tuple[Path, Path]:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    json_path = output_path / f"{prefix}.json"
+    csv_path = output_path / f"{prefix}.csv"
+
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2)
+
+    fieldnames = []
+    if history:
+        fieldnames = list(dict.fromkeys(key for row in history for key in row.keys()))
+    else:
+        fieldnames = ["epoch"]
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in history:
+            normalized = {k: ("" if row.get(k) is None else row.get(k)) for k in fieldnames}
+            writer.writerow(normalized)
+
+    return json_path, csv_path
+
+
+def plot_bleu4_trend(output_dir: str | Path, history: list[dict[str, Any]], prefix: str = "epoch_metrics") -> Path:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    epochs: list[int] = []
+    bleu4_values: list[float] = []
+    for row in history:
+        epoch = row.get("epoch")
+        bleu = row.get("val_bleu_4")
+        if epoch is None or bleu is None:
+            continue
+        epochs.append(int(epoch))
+        bleu4_values.append(float(bleu))
+
+    fig_path = output_path / f"{prefix}_bleu4_trend.png"
+    plt.figure(figsize=(10, 5))
+    if epochs and bleu4_values:
+        plt.plot(epochs, bleu4_values, marker="o", linewidth=2, color="tab:blue")
+        plt.title("BLEU-4 trend across epochs")
+        plt.xlabel("Epoch")
+        plt.ylabel("BLEU-4")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+    else:
+        plt.text(0.5, 0.5, "No BLEU-4 data available", ha="center", va="center")
+        plt.axis("off")
+        plt.title("BLEU-4 trend across epochs")
+    fig = plt.gcf()
+    fig.savefig(fig_path, dpi=200)
+    plt.close(fig)
+    return fig_path
 
 
 def _unwrap_batch(batch: dict[str, Any], device: torch.device) -> dict[str, torch.Tensor]:
@@ -445,6 +515,20 @@ def main():
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--target_field", type=str, default=None,
                         help="'translation' (default) o 'orth' (gloss)")
+    parser.add_argument("--train_csv", type=str, default=None,
+                        help="Override per il CSV di training")
+    parser.add_argument("--val_csv", type=str, default=None,
+                        help="Override per il CSV di validazione")
+    parser.add_argument("--train_landmarks_dir", type=str, default=None,
+                        help="Override per la cartella landmarks di training")
+    parser.add_argument("--val_landmarks_dir", type=str, default=None,
+                        help="Override per la cartella landmarks di validazione")
+    parser.add_argument("--test_csv", type=str, default=None,
+                        help="CSV opzionale da usare per il test finale")
+    parser.add_argument("--test_landmarks_dir", type=str, default=None,
+                        help="Cartella landmarks opzionale per il test finale")
+    parser.add_argument("--run_test", action="store_true",
+                        help="Esegue la valutazione sul set test dopo il training")
     parser.add_argument("--seed", type=int, default=None,
                         help="Seed globale per la riproducibilità (default: 42)")
     args = parser.parse_args()
@@ -456,6 +540,9 @@ def main():
         "val_csv":             "dataset/PHOENIX-2014-T.dev.corpus.csv",
         "train_landmarks_dir": "dataset/landmarks_train",
         "val_landmarks_dir":   "dataset/landmarks_dev",
+        "test_csv":            None,
+        "test_landmarks_dir": None,
+        "run_test":           False,
         "output_dir":          "outputs/phoenix_run1",
         "target_field":        "orth",   # "orth" per i gloss, "translation" per le traduzioni in tedesco
 
@@ -551,6 +638,20 @@ def main():
         cfg["dropout"] = args.dropout
     if args.target_field is not None:
         cfg["target_field"] = args.target_field
+    if args.train_csv is not None:
+        cfg["train_csv"] = args.train_csv
+    if args.val_csv is not None:
+        cfg["val_csv"] = args.val_csv
+    if args.train_landmarks_dir is not None:
+        cfg["train_landmarks_dir"] = args.train_landmarks_dir
+    if args.val_landmarks_dir is not None:
+        cfg["val_landmarks_dir"] = args.val_landmarks_dir
+    if args.test_csv is not None:
+        cfg["test_csv"] = args.test_csv
+    if args.test_landmarks_dir is not None:
+        cfg["test_landmarks_dir"] = args.test_landmarks_dir
+    if args.run_test:
+        cfg["run_test"] = True
     if args.seed is not None:
         cfg["seed"] = args.seed
 
@@ -595,6 +696,8 @@ def main():
         val_csv=cfg["val_csv"],
         train_landmarks_dir=cfg["train_landmarks_dir"],
         val_landmarks_dir=cfg["val_landmarks_dir"],
+        test_csv=cfg.get("test_csv"),
+        test_landmarks_dir=cfg.get("test_landmarks_dir"),
         tokenizer=tokenizer,
         batch_size=cfg["batch_size"],
         num_workers=cfg["num_workers"],
@@ -691,6 +794,7 @@ def main():
     # ─────── Training loop ────────────────────────────────
     best_bleu  = 0.0
     best_epoch = 0
+    epoch_history: list[dict[str, Any]] = []
 
     print(f"\n[TRAIN] Inizio training su PHOENIX-2014-T")
     print(f"  target_field={cfg['target_field']} | epochs={cfg['epochs']} | "
@@ -752,6 +856,18 @@ def main():
                 f"val_bleu4={val_stats.get('bleu_4', 0.0):.4f}"
             )
 
+            epoch_record = {
+                "epoch": epoch,
+                "train_loss": float(train_stats["loss"]),
+                "train_ppl": float(train_stats["ppl"]),
+                "val_loss": float(val_stats["loss"]),
+                "val_ppl": float(val_stats["ppl"]),
+                "val_bleu_1": float(val_stats.get("bleu_1", 0.0)),
+                "val_bleu_2": float(val_stats.get("bleu_2", 0.0)),
+                "val_bleu_3": float(val_stats.get("bleu_3", 0.0)),
+                "val_bleu_4": float(val_stats.get("bleu_4", 0.0)),
+                "val_bleu": float(val_stats.get("bleu", val_stats.get("bleu_4", 0.0))),
+            }
             if val_bleu > best_bleu:
                 best_bleu  = val_bleu
                 best_epoch = epoch
@@ -765,11 +881,29 @@ def main():
                     "best_bleu": best_bleu,
                     "cfg":       cfg,
                 }, ckpt_path)
+                epoch_record["best_bleu"] = float(best_bleu)
                 print(f"  ✓ Nuovo best! BLEU-4={best_bleu:.4f} → {ckpt_path}")
+            else:
+                epoch_record["best_bleu"] = float(best_bleu)
         else:
             # Epoche senza validazione: stampa solo le stats di training
             print(f"[E{epoch:3d}] train_loss={train_stats['loss']:.4f} "
                   f"train_ppl={train_stats['ppl']:.2f}")
+            epoch_record = {
+                "epoch": epoch,
+                "train_loss": float(train_stats["loss"]),
+                "train_ppl": float(train_stats["ppl"]),
+                "val_loss": None,
+                "val_ppl": None,
+                "val_bleu_1": None,
+                "val_bleu_2": None,
+                "val_bleu_3": None,
+                "val_bleu_4": None,
+                "val_bleu": None,
+                "best_bleu": float(best_bleu),
+            }
+
+        epoch_history.append(epoch_record)
 
         # ─────── [FIX 5] Attention visualization hook ─────────────────────────
         # In origine il blocco try/else causava la stampa delle stats di training
@@ -805,8 +939,28 @@ def main():
         "cfg":       cfg,
     }, last_path)
 
+    if cfg.get("run_test") and "test" in loaders:
+        print("\n[TRAIN] Esecuzione test finale sul set test...")
+        test_loader = loaders["test"]
+        test_stats = validate(
+            model=model,
+            loader=test_loader,
+            tokenizer=tokenizer,
+            device=device,
+            use_amp=cfg["use_amp"],
+        )
+        print(
+            f"[TEST] loss={test_stats['loss']:.4f} ppl={test_stats['ppl']:.2f} "
+            f"bleu1={test_stats.get('bleu_1', 0.0):.4f} "
+            f"bleu4={test_stats.get('bleu_4', 0.0):.4f}"
+        )
+
+    metrics_json_path, metrics_csv_path = save_epoch_history(output_dir, epoch_history, "epoch_metrics")
+    bleu4_plot_path = plot_bleu4_trend(output_dir, epoch_history, "epoch_metrics")
     print(f"\n[TRAIN] Completato!")
     print(f"[TRAIN] Best BLEU-4: {best_bleu:.4f} all'epoca {best_epoch}")
+    print(f"[TRAIN] Storico metriche per epoca salvato in: {metrics_json_path} e {metrics_csv_path}")
+    print(f"[TRAIN] Trend BLEU-4 salvato in: {bleu4_plot_path}")
     print(f"[TRAIN] Ultimo checkpoint: {last_path}")
 
 

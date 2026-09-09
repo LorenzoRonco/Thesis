@@ -50,16 +50,28 @@ import torch.nn.functional as F
 from torch.amp import autocast
 from torch.utils.data import DataLoader
 
-from .data.phoenix_loader import (
-    PhoenixDataset,
-    SentenceTokenizer,
-    collate_fn,
-    build_tokenizer,
-)
-from .models.transformer import SignLanguageTransformer
-from .two_stage import GlossToTextTransformer
-from .bleu import compute_bleu as _phoenix_compute_bleu
-from .rouge import rouge as _phoenix_rouge
+try:
+    from .data.phoenix_loader import (
+        PhoenixDataset,
+        SentenceTokenizer,
+        collate_fn,
+        build_tokenizer,
+    )
+    from .models.transformer import SignLanguageTransformer
+    from .two_stage import GlossToTextTransformer
+    from .bleu import compute_bleu as _phoenix_compute_bleu
+    from .rouge import rouge as _phoenix_rouge
+except ImportError:  # pragma: no cover - fallback for direct script execution
+    from transformer_only.data.phoenix_loader import (
+        PhoenixDataset,
+        SentenceTokenizer,
+        collate_fn,
+        build_tokenizer,
+    )
+    from transformer_only.models.transformer import SignLanguageTransformer
+    from transformer_only.two_stage import GlossToTextTransformer
+    from transformer_only.bleu import compute_bleu as _phoenix_compute_bleu
+    from transformer_only.rouge import rouge as _phoenix_rouge
 
 
 # ─────────────────────────────────────────────────────────────
@@ -496,14 +508,19 @@ def evaluate_stage1(cfg: dict) -> dict:
 
         hyps = []
         for i in range(src.size(0)):
-            src_i    = src[i:i+1]
-            mask_i   = src_key_padding_mask[i:i+1] if src_key_padding_mask is not None else None
-            best_ids = model.beam_search(src_i, bos_id, eos_id,
-                                        beam_size=4, max_len=128,
-                                        length_penalty=1.5,  # >1 penalizza sequenze lunghe → meno inserzioni
-                                        src_key_padding_mask=mask_i)
-        hyps.append(best_ids)
-        
+            src_i = src[i:i+1]
+            mask_i = src_mask[i:i+1] if src_mask is not None else None
+            best_ids = model.beam_search(
+                src_i,
+                gloss_tokenizer.bos_id,
+                gloss_tokenizer.eos_id,
+                beam_size=4,
+                max_len=128,
+                length_penalty=1.5,
+                src_key_padding_mask=mask_i,
+            )
+            hyps.append(best_ids)
+
         all_hyps.extend(decode_batch(hyps, gloss_tokenizer))
         all_refs.extend(batch["targets"])
 
@@ -832,11 +849,16 @@ def main():
                         help="Dir output Stage 2 (per tokenizer translation)")
 
     # Dataset
-    parser.add_argument("--val_csv",              type=str,
-                        default="dataset/PHOENIX-2014-T.dev.corpus.csv")
-    parser.add_argument("--landmarks_dir",        type=str,
-                        default="dataset/landmarks_dev",
+    parser.add_argument("--split",                type=str, default=None,
+                        choices=["dev", "test"],
+                        help="Split da valutare: dev o test")
+    parser.add_argument("--val_csv",              type=str, default=None)
+    parser.add_argument("--eval_csv",             type=str, default=None,
+                        help="Override esplicito del CSV di valutazione")
+    parser.add_argument("--landmarks_dir",        type=str, default=None,
                         help="Richiesto per stage1 e pipeline")
+    parser.add_argument("--eval_landmarks_dir",   type=str, default=None,
+                        help="Override esplicito della cartella landmarks di valutazione")
     parser.add_argument("--train_csv",            type=str, default=None,
                         help="CSV training (per stats normalizzazione)")
     parser.add_argument("--train_landmarks_dir",  type=str,
@@ -860,6 +882,17 @@ def main():
 
     args = parser.parse_args()
     cfg  = vars(args)
+
+    if cfg.get("split") == "test":
+        cfg["val_csv"] = cfg.get("eval_csv") or "dataset/PHOENIX-2014-T.test.corpus.csv"
+        cfg["landmarks_dir"] = cfg.get("eval_landmarks_dir") or "dataset/landmarks_test"
+    elif cfg.get("split") == "dev":
+        cfg["val_csv"] = cfg.get("eval_csv") or "dataset/PHOENIX-2014-T.dev.corpus.csv"
+        cfg["landmarks_dir"] = cfg.get("eval_landmarks_dir") or "dataset/landmarks_dev"
+    if cfg.get("val_csv") is None:
+        cfg["val_csv"] = "dataset/PHOENIX-2014-T.dev.corpus.csv"
+    if cfg.get("landmarks_dir") is None:
+        cfg["landmarks_dir"] = "dataset/landmarks_dev"
 
     device = torch.device(cfg["device"] if torch.cuda.is_available() else "cpu")
 

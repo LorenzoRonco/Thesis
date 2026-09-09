@@ -534,9 +534,9 @@ def main():
     parser.add_argument(
         "--split",
         type=str,
-        choices=["train", "dev"],
+        choices=["train", "dev", "test"],
         default="train",
-        help="Which corpus split to process (train or dev).",
+        help="Which corpus split to process (train, dev, or test).",
     )
     parser.add_argument(
         "--data-dir",

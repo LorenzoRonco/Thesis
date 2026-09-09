@@ -31,6 +31,10 @@ import random
 from pathlib import Path
 from functools import partial
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 REPO_ROOT = Path(__file__).parent.absolute()
@@ -44,9 +48,14 @@ from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 import numpy as np
 
-from .data.phoenix_loader import SentenceTokenizer, build_tokenizer
-from .two_stage import GlossToTextTransformer
-from .train import WarmupCosineScheduler   # scheduler già esistente
+try:
+    from .data.phoenix_loader import SentenceTokenizer, build_tokenizer
+    from .two_stage import GlossToTextTransformer
+    from .train import WarmupCosineScheduler   # scheduler già esistente
+except ImportError:  # pragma: no cover - fallback for direct script execution
+    from transformer_only.data.phoenix_loader import SentenceTokenizer, build_tokenizer
+    from transformer_only.two_stage import GlossToTextTransformer
+    from transformer_only.train import WarmupCosineScheduler
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -260,6 +269,64 @@ def validate_stage2(
     return {"loss": avg_loss, "ppl": ppl, "bleu": bleu4 * 100.0}
 
 
+def save_epoch_history(output_dir: str | Path, history: list[dict], prefix: str = "epoch_metrics") -> tuple[Path, Path]:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    json_path = output_path / f"{prefix}.json"
+    csv_path = output_path / f"{prefix}.csv"
+
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2)
+
+    fieldnames = []
+    if history:
+        fieldnames = list(dict.fromkeys(key for row in history for key in row.keys()))
+    else:
+        fieldnames = ["epoch"]
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in history:
+            writer.writerow({k: ("" if row.get(k) is None else row.get(k)) for k in fieldnames})
+
+    return json_path, csv_path
+
+
+def plot_bleu4_trend(output_dir: str | Path, history: list[dict], prefix: str = "epoch_metrics") -> Path:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    epochs: list[int] = []
+    bleu_values: list[float] = []
+    for row in history:
+        epoch = row.get("epoch")
+        bleu = row.get("val_bleu")
+        if epoch is None or bleu is None:
+            continue
+        epochs.append(int(epoch))
+        bleu_values.append(float(bleu))
+
+    fig_path = output_path / f"{prefix}_bleu4_trend.png"
+    plt.figure(figsize=(10, 5))
+    if epochs and bleu_values:
+        plt.plot(epochs, bleu_values, marker="o", linewidth=2, color="tab:green")
+        plt.title("BLEU-4 trend across epochs")
+        plt.xlabel("Epoch")
+        plt.ylabel("BLEU-4")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+    else:
+        plt.text(0.5, 0.5, "No BLEU-4 data available", ha="center", va="center")
+        plt.axis("off")
+        plt.title("BLEU-4 trend across epochs")
+    fig = plt.gcf()
+    fig.savefig(fig_path, dpi=200)
+    plt.close(fig)
+    return fig_path
+
+
 # ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
@@ -271,6 +338,14 @@ def main():
     parser.add_argument("--batch_size", type=int,   default=None)
     parser.add_argument("--stage1_dir", type=str,   default=None,
                         help="Output dir del Modello 1 (per caricare il tokenizer gloss)")
+    parser.add_argument("--train_csv",  type=str,   default=None,
+                        help="Override per il CSV di training")
+    parser.add_argument("--val_csv",    type=str,   default=None,
+                        help="Override per il CSV di validazione")
+    parser.add_argument("--test_csv",   type=str,   default=None,
+                        help="CSV opzionale da usare per il test finale")
+    parser.add_argument("--run_test", action="store_true",
+                        help="Esegue la valutazione sul set test dopo il training")
     parser.add_argument("--seed",       type=int,   default=None,
                         help="Seed globale per la riproducibilità (default: 42)")
     parser.add_argument("--early_stage_val_interval", type=int, default=None,
@@ -285,6 +360,8 @@ def main():
         # Dataset
         "train_csv": "dataset/PHOENIX-2014-T.train.corpus.csv",
         "val_csv":   "dataset/PHOENIX-2014-T.dev.corpus.csv",
+        "test_csv":  None,
+        "run_test":  False,
 
         # Directory output Modello 1 (per tokenizer gloss)
         # Se None, si costruisce un tokenizer gloss dal CSV
@@ -332,6 +409,10 @@ def main():
     if args.lr is not None:         cfg["lr"]                = args.lr
     if args.batch_size is not None: cfg["batch_size"]        = args.batch_size
     if args.stage1_dir is not None: cfg["stage1_output_dir"] = args.stage1_dir
+    if args.train_csv is not None:  cfg["train_csv"]         = args.train_csv
+    if args.val_csv is not None:    cfg["val_csv"]           = args.val_csv
+    if args.test_csv is not None:   cfg["test_csv"]          = args.test_csv
+    if args.run_test:               cfg["run_test"]          = True
     if args.seed is not None:       cfg["seed"]              = args.seed
     if args.early_stage_val_interval is not None:
         cfg["early_stage_val_interval"] = args.early_stage_val_interval
@@ -457,6 +538,7 @@ def main():
     # ── Training loop ─────────────────────────
     best_bleu  = 0.0
     best_epoch = 0
+    epoch_history: list[dict] = []
 
     print(f"\n[STAGE2] Inizio training gloss→translation")
     print(f"  epochs={cfg['epochs']} | lr={cfg['lr']} | batch={cfg['batch_size']} | seed={cfg['seed']}\n")
@@ -512,6 +594,18 @@ def main():
                 f"val_loss={val_stats['loss']:.4f} val_ppl={val_stats['ppl']:.2f} "
                 f"val_bleu={val_stats['bleu']:.2f} ({stage_label}, every {val_interval} epoche)"
             )
+
+            epoch_record = {
+                "epoch": epoch,
+                "train_loss": float(avg_loss),
+                "train_ppl": float(ppl),
+                "val_loss": float(val_stats["loss"]),
+                "val_ppl": float(val_stats["ppl"]),
+                "val_bleu": float(val_stats["bleu"]),
+                "best_bleu": float(best_bleu),
+                "stage": stage_label,
+                "val_interval": int(val_interval),
+            }
             if val_stats["bleu"] > best_bleu:
                 best_bleu  = val_stats["bleu"]
                 best_epoch = epoch
@@ -525,9 +619,23 @@ def main():
                     "gloss_vocab_size":  gloss_tokenizer.vocab_size,
                     "trans_vocab_size":  trans_tokenizer.vocab_size,
                 }, ckpt_path)
+                epoch_record["best_bleu"] = float(best_bleu)
                 print(f"  ✓ Nuovo best! BLEU-4={best_bleu:.2f} → {ckpt_path}")
         else:
             print(f"[E{epoch:3d}] train_loss={avg_loss:.4f} ppl={ppl:.2f}")
+            epoch_record = {
+                "epoch": epoch,
+                "train_loss": float(avg_loss),
+                "train_ppl": float(ppl),
+                "val_loss": None,
+                "val_ppl": None,
+                "val_bleu": None,
+                "best_bleu": float(best_bleu),
+                "stage": "training",
+                "val_interval": None,
+            }
+
+        epoch_history.append(epoch_record)
 
     # Checkpoint finale
     torch.save({
@@ -539,7 +647,33 @@ def main():
         "trans_vocab_size": trans_tokenizer.vocab_size,
     }, output_dir / "last.pt")
 
+    if cfg.get("run_test") and cfg.get("test_csv"):
+        print("\n[STAGE2] Esecuzione test finale sul set test...")
+        test_ds = GlossTranslationDataset(
+            cfg["test_csv"], gloss_tokenizer, trans_tokenizer,
+            max_gloss_len=cfg["max_gloss_len"], max_trans_len=cfg["max_trans_len"],
+        )
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=cfg["batch_size"] * 2,
+            shuffle=False,
+            num_workers=cfg["num_workers"],
+            collate_fn=_collate,
+            pin_memory=True,
+            persistent_workers=(cfg["num_workers"] > 0),
+            worker_init_fn=_make_worker_init_fn(cfg["seed"]),
+        )
+        test_stats = validate_stage2(
+            model, test_loader, trans_tokenizer, device,
+            use_amp=cfg["use_amp"], max_decode_len=cfg["max_decode_len"],
+        )
+        print(f"[TEST/STAGE2] loss={test_stats['loss']:.4f} ppl={test_stats['ppl']:.2f} bleu={test_stats['bleu']:.2f}")
+
+    metrics_json_path, metrics_csv_path = save_epoch_history(output_dir, epoch_history, "epoch_metrics")
+    bleu4_plot_path = plot_bleu4_trend(output_dir, epoch_history, "epoch_metrics")
     print(f"\n[STAGE2] Completato! Best BLEU-4: {best_bleu:.2f} all'epoca {best_epoch}")
+    print(f"[STAGE2] Storico metriche per epoca salvato in: {metrics_json_path} e {metrics_csv_path}")
+    print(f"[STAGE2] Trend BLEU-4 salvato in: {bleu4_plot_path}")
 
 
 if __name__ == "__main__":
