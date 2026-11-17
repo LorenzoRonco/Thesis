@@ -329,14 +329,28 @@ python scripts/extract_landmarks.py --split test --output-dir dataset/landmarks_
 ### 12.2 Model Training
 
 ```bash
-python transformer_only/train.py
+# Stage 1: landmarks → glosses
+python -m transformer_only.train
+
+# Stage 2: glosses → text
+python -m transformer_only.train_stage2 --stage1_dir outputs/phoenix_run1
 ```
 
 ### 12.3 Evaluation
 
 ```bash
-python transformer_only/evaluate.py --checkpoint outputs/phoenix_run1/best.pt
+python -m transformer_only.evaluate --mode pipeline \
+  --checkpoint outputs/phoenix_run1/best.pt \
+  --stage2_checkpoint outputs/phoenix_stage2/best.pt \
+  --val_csv dataset/PHOENIX-2014-T.dev.corpus.csv \
+  --landmarks_dir dataset/landmarks_dev \
+  --train_csv dataset/PHOENIX-2014-T.train.corpus.csv \
+  --train_landmarks_dir dataset/landmarks_train \
+  --stage1_dir outputs/phoenix_run1 \
+  --stage2_dir outputs/phoenix_stage2
 ```
+
+The `stage1` and `stage2` evaluation modes and the diagnostic scripts are documented in [docs/usage.md](docs/usage.md).
 
 ---
 
@@ -361,14 +375,41 @@ The landmark representation intentionally prioritizes body pose, hand motion, an
 
 ---
 
-## 15. Key Files
+## 15. Repository Structure and Documentation
+
+```
+.
+├── README.md                  # this document
+├── requirements.txt           # Python dependencies
+├── docs/                      # additional documentation
+├── models/                    # MediaPipe holistic_landmarker.task
+├── scripts/                   # landmark extraction, inspection and visualization
+└── transformer_only/          # data loading, models, training and evaluation
+    ├── data/phoenix_loader.py
+    ├── models/transformer.py  # stage 1: SignLanguageTransformer
+    ├── two_stage.py           # stage 2: GlossToTextTransformer + pipeline
+    ├── train.py / train_stage2.py
+    ├── evaluate.py, bleu.py, rouge.py, ctc_decode.py
+    ├── attention_visualizer.py
+    └── ctc_diagnostics_standalone.py
+```
+
+Key files:
 
 - [scripts/extract_landmarks.py](scripts/extract_landmarks.py)
 - [transformer_only/data/phoenix_loader.py](transformer_only/data/phoenix_loader.py)
 - [transformer_only/models/transformer.py](transformer_only/models/transformer.py)
+- [transformer_only/two_stage.py](transformer_only/two_stage.py)
 - [transformer_only/train.py](transformer_only/train.py)
+- [transformer_only/train_stage2.py](transformer_only/train_stage2.py)
 - [transformer_only/evaluate.py](transformer_only/evaluate.py)
 - [scripts/visualize_landmarks.py](scripts/visualize_landmarks.py)
+
+Further documentation:
+
+- [docs/usage.md](docs/usage.md) – training, evaluation and diagnostic commands
+- [docs/optimization_techniques.md](docs/optimization_techniques.md) – optimization, regularisation and reproducibility techniques
+- [docs/attention_debugging.md](docs/attention_debugging.md) – how to inspect and interpret cross-attention weights
 
 ---
 

@@ -1,4 +1,4 @@
-# Dataset e Video
+# Datasets, checkpoints and videos
 dataset/
 checkpoints/
 *.mp4
@@ -8,13 +8,14 @@ checkpoints/
 *.webm
 *.flv
 
-# Output di processing
-segmented/
+# Training / processing outputs
+outputs/
 analysis/
 logs/
+visualization_output/
 *.log
 
-# Python cache e ambiente
+# Python cache and virtual environments
 __pycache__/
 *.py[cod]
 *$py.class
@@ -23,6 +24,7 @@ __pycache__/
 env/
 venv/
 ENV/
+.venv/
 *.egg-info/
 dist/
 build/
@@ -38,18 +40,3 @@ build/
 # OS
 .DS_Store
 Thumbs.db
-
-# Stato processing (generato)
-processing_state.json
-config_current.json
-
-
-# report
-video_integrity_report.txt
-
-.venv
-
-visualization_output
-
-outputs
-outputs/
