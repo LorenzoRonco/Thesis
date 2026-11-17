@@ -190,3 +190,9 @@ Prossimamente:
 
 Per dubbi o problemi: vedi i log di esecuzione per dettagli
 
+## Frameworks e dipendenze
+
+Questo progetto utilizza diversi framework e librerie per il preprocessing, l'estrazione dei landmark e l'addestramento dei modelli. Per un elenco completo e per capire dove ciascuna libreria viene usata, vedi il file di riepilogo:
+
+- `docs/FRAMEWORKS_USED.md`
+

@@ -1,328 +1,378 @@
-"""
-Visualize extracted landmarks from .npy files on video.
-Draws skeleton overlay using pre-extracted MediaPipe landmarks to verify extraction quality.
-"""
+#!/usr/bin/env python3
+"""Visualize 94 holistic landmarks over a single dataset image.
 
-import argparse
+Usage examples:
+  python scripts/visualize_landmarks.py --image dataset/dev/<sequence>/<frame>.png
+  python scripts/visualize_landmarks.py --split dev
+"""
 from pathlib import Path
-
+import argparse
+import sys
 import cv2
 import numpy as np
-
-# Landmark connection indices for MediaPipe upper body (0-16)
-# Now includes arms: shoulders (11-12), elbows (13-14), wrists (15-16)
-POSE_CONNECTIONS = frozenset([
-    (0, 1), (0, 2), (0, 3), (0, 4),  # Nose to eyes/ears
-    (1, 3), (2, 4),                   # Eyes to ears
-    # Left arm: shoulder -> elbow -> wrist
-    (11, 13), (13, 15),
-    # Right arm: shoulder -> elbow -> wrist  
-    (12, 14), (14, 16),
-    # Shoulders connection
-    (11, 12),
-])
-
-HAND_CONNECTIONS = frozenset([
-    # Thumb
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    # Index
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    # Middle
-    (0, 9), (9, 10), (10, 11), (11, 12),
-    # Ring
-    (0, 13), (13, 14), (14, 15), (15, 16),
-    # Pinky
-    (0, 17), (17, 18), (18, 19), (19, 20),
-])
-
-# Color scheme (BGR)
-COLORS = {
-    'pose': (0, 255, 0),        # Green
-    'left_hand': (255, 0, 0),   # Blue
-    'right_hand': (0, 0, 255),  # Red
-    'face': (255, 255, 0),      # Cyan
-}
-
-LANDMARK_RADIUS = 4
-CONNECTION_THICKNESS = 2
-
-# POSE_LANDMARKS includes shoulders (11-12), elbows (13-14), wrists (15-16)
-POSE_LANDMARKS = 17
-LEFT_HAND_LANDMARKS = 21
-RIGHT_HAND_LANDMARKS = 21
-FACE_LANDMARKS = 468
-POSE_END = POSE_LANDMARKS
-LEFT_HAND_END = POSE_END + LEFT_HAND_LANDMARKS
-RIGHT_HAND_END = LEFT_HAND_END + RIGHT_HAND_LANDMARKS
+import importlib.util
+import mediapipe as mp
 
 
-def find_video_file(video_path):
-    """Find video file, handling partial naming patterns."""
-    video_path = Path(video_path)
-    
-    # If file exists as-is, return it
-    if video_path.exists():
-        return video_path
-    
-    # If it's just a filename, search in dataset/segmented/
-    if not video_path.is_absolute():
-        root_dir = Path(__file__).parent.parent
-        segmented_dir = root_dir / "dataset" / "segmented"
-        
-        # Try exact match
-        full_path = segmented_dir / video_path.name
-        if full_path.exists():
-            return full_path
-        
-        # Try with wildcard pattern (handles SENTENCE_ID_SENTENCE_NAME pattern)
-        stem = video_path.stem
-        matches = list(segmented_dir.glob(f"*_{stem}.mp4"))
-        if matches:
-            return matches[0]
-    
+def load_landmark_extractor_module(repo_root: Path):
+    """Dynamically load the existing extract_landmarks.py module.
+
+    Returns the LandmarkExtractor class.
+    """
+    src = repo_root / "scripts" / "extract_landmarks.py"
+    spec = importlib.util.spec_from_file_location("extract_landmarks", str(src))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.LandmarkExtractor
+
+
+def pick_example_image(root: Path, split: str = "dev") -> Path | None:
+    data_dir = root / "dataset" / split
+    if not data_dir.exists():
+        return None
+    # Find first sequence folder then first image inside
+    for seq in sorted([p for p in data_dir.iterdir() if p.is_dir()]):
+        imgs = sorted(list(seq.glob("*.png")) + list(seq.glob("*.jpg")))
+        if imgs:
+            return imgs[0]
     return None
 
 
-def find_landmarks_file(video_path):
-    """Find corresponding .npy landmarks file for a video."""
-    video_path = Path(video_path)
-    video_name = video_path.stem
-    
-    # Search in dataset/landmarks/
-    root_dir = Path(__file__).parent.parent
-    landmarks_dir = root_dir / "dataset" / "landmarks"
-    
-    # Try exact match
-    npy_file = landmarks_dir / f"{video_name}_landmarks.npy"
-    if npy_file.exists():
-        return npy_file
-    
-    # Try with underscore prefix pattern (SENTENCE_ID_SENTENCE_NAME_landmarks.npy)
-    if landmarks_dir.exists():
-        for npy in landmarks_dir.glob(f"*_{video_name}_landmarks.npy"):
-            return npy
-    
-    # Try any fuzzy match as fallback
-    if landmarks_dir.exists():
-        for npy in landmarks_dir.glob(f"*{video_name}*.npy"):
-            if npy.name.endswith("_landmarks.npy"):
-                return npy
-    
-    return None
+def draw_landmarks_overlay(image_path: Path, landmarks: np.ndarray, out_path: Path, draw_ids: bool = True, draw_points: bool = True):
+    img = cv2.imread(str(image_path))
+    if img is None:
+        raise RuntimeError(f"Cannot read image: {image_path}")
+    h, w = img.shape[:2]
+
+    # Colors for groups: pose, left hand, right hand, face
+    colors = {
+        'pose': (0, 255, 0),        # green
+        'left_hand': (255, 0, 0),   # blue
+        'right_hand': (0, 0, 255),  # red
+        'face': (0, 255, 255),      # yellow
+    }
+
+    # Landmark ranges from extractor
+    groups = [
+        (0, 16, 'pose'),
+        (17, 37, 'left_hand'),
+        (38, 58, 'right_hand'),
+        (59, 93, 'face'),
+    ]
+
+    overlay = img.copy()
+    for start, end, gname in groups:
+        for i in range(start, end + 1):
+            if i >= landmarks.shape[0]:
+                continue
+            x, y, z, conf = landmarks[i]
+            if conf <= 0.0:
+                continue
+            # Some face landmarks may be slightly outside [0,1]; clamp
+            px = int(np.clip(x, 0.0, 1.0) * (w - 1))
+            py = int(np.clip(y, 0.0, 1.0) * (h - 1))
+            if draw_points:
+                cv2.circle(overlay, (px, py), radius=3, color=colors[gname], thickness=-1)
+            if draw_ids:
+                cv2.putText(overlay, str(i), (px + 4, py - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+
+    # Blend overlay for semi-transparent points
+    out = cv2.addWeighted(overlay, 0.9, img, 0.1, 0)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out_path), out)
 
 
-def draw_connections(frame, points, connections, color):
-    """Draw lines connecting landmarks."""
-    for start, end in connections:
-        if start < len(points) and end < len(points):
-            pt1 = points[start]
-            pt2 = points[end]
-            # Only draw if both points have non-zero confidence
-            if pt1[2] > 0 and pt2[2] > 0:
-                cv2.line(frame, (int(pt1[0]), int(pt1[1])), 
-                        (int(pt2[0]), int(pt2[1])), color, CONNECTION_THICKNESS)
+def draw_skeleton_overlay(image_path: Path, landmarks: np.ndarray, out_path: Path):
+    """Draw pose (upper-body) and hand skeletons using hardcoded connection sets.
+
+    This version keeps the original image as background. Use draw_full_skeleton_overlay
+    for transparent or face-including skeletons.
+    """
+    img = cv2.imread(str(image_path))
+    if img is None:
+        raise RuntimeError(f"Cannot read image: {image_path}")
+    h, w = img.shape[:2]
+
+    overlay = img.copy()
+
+    # Simple upper-body pose connections (use only indices 0..16)
+    pose_connections = [
+        (11, 13), (13, 15),  # left shoulder->elbow->wrist
+        (12, 14), (14, 16),  # right shoulder->elbow->wrist
+        (11, 12),            # shoulders
+        (0, 11), (0, 12),    # nose to shoulders (approx neck)
+    ]
+
+    for a, b in pose_connections:
+        if a < landmarks.shape[0] and b < landmarks.shape[0]:
+            xa, ya, za, ca = landmarks[a]
+            xb, yb, zb, cb = landmarks[b]
+            if ca > 0.0 and cb > 0.0:
+                pa = (int(np.clip(xa, 0.0, 1.0) * (w - 1)), int(np.clip(ya, 0.0, 1.0) * (h - 1)))
+                pb = (int(np.clip(xb, 0.0, 1.0) * (w - 1)), int(np.clip(yb, 0.0, 1.0) * (h - 1)))
+                cv2.line(overlay, pa, pb, (0, 255, 0), 2)
+
+    # Hand connections for 21-landmark hands
+    hand_connections = [
+        (0, 1), (1, 2), (2, 3), (3, 4),
+        (0, 5), (5, 6), (6, 7), (7, 8),
+        (0, 9), (9, 10), (10, 11), (11, 12),
+        (0, 13), (13, 14), (14, 15), (15, 16),
+        (0, 17), (17, 18), (18, 19), (19, 20),
+    ]
+
+    left_offset = 17
+    for a, b in hand_connections:
+        ia, ib = a + left_offset, b + left_offset
+        if ia < landmarks.shape[0] and ib < landmarks.shape[0]:
+            xa, ya, za, ca = landmarks[ia]
+            xb, yb, zb, cb = landmarks[ib]
+            if ca > 0.0 and cb > 0.0:
+                pa = (int(np.clip(xa, 0.0, 1.0) * (w - 1)), int(np.clip(ya, 0.0, 1.0) * (h - 1)))
+                pb = (int(np.clip(xb, 0.0, 1.0) * (w - 1)), int(np.clip(yb, 0.0, 1.0) * (h - 1)))
+                cv2.line(overlay, pa, pb, (255, 0, 0), 2)
+
+    right_offset = 38
+    for a, b in hand_connections:
+        ia, ib = a + right_offset, b + right_offset
+        if ia < landmarks.shape[0] and ib < landmarks.shape[0]:
+            xa, ya, za, ca = landmarks[ia]
+            xb, yb, zb, cb = landmarks[ib]
+            if ca > 0.0 and cb > 0.0:
+                pa = (int(np.clip(xa, 0.0, 1.0) * (w - 1)), int(np.clip(ya, 0.0, 1.0) * (h - 1)))
+                pb = (int(np.clip(xb, 0.0, 1.0) * (w - 1)), int(np.clip(yb, 0.0, 1.0) * (h - 1)))
+                cv2.line(overlay, pa, pb, (0, 0, 255), 2)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out_path), overlay)
 
 
-def draw_points(frame, points, color, radius=LANDMARK_RADIUS):
-    """Draw circles at landmark positions."""
-    for pt in points:
-        if pt[2] > 0:  # Only draw if confidence > 0
-            cv2.circle(frame, (int(pt[0]), int(pt[1])), radius, color, -1)
+def draw_full_skeleton_overlay(image_path: Path, landmarks: np.ndarray, out_path: Path, include_face: bool = False, transparent: bool = False, scale: float = 1.0):
+    """Draw skeleton including pose, hands, and optional face connections.
 
+    If `transparent` is True, the output is a RGBA PNG with transparent background.
+    `scale` scales the output image resolution (and implicitly the drawing thickness).
+    """
+    # Determine base size from image
+    img = cv2.imread(str(image_path))
+    if img is None:
+        raise RuntimeError(f"Cannot read image: {image_path}")
+    h0, w0 = img.shape[:2]
+    w, h = int(w0 * scale), int(h0 * scale)
 
-def visualize_from_npy(video_path, landmarks_path, output_path=None):
-    """Visualize landmarks from .npy file on video."""
-    
-    video_path = Path(video_path)
-    landmarks_path = Path(landmarks_path)
-    
-    print(f"Loading video: {video_path}")
-    cap = cv2.VideoCapture(str(video_path))
-    
-    if not cap.isOpened():
-        print(f"ERROR: Cannot open video: {video_path}")
-        return
-    
-    # Get video properties
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    print(f"Video: {width}x{height} @ {fps} FPS ({total_frames} frames)")
-    
-    # Load landmarks from .npy
-    print(f"Loading landmarks: {landmarks_path}")
-    landmarks = np.load(str(landmarks_path), allow_pickle=False)
-    print(f"Landmarks shape: {landmarks.shape}")
-    
-    if landmarks.shape[0] != total_frames:
-        print(f"WARNING: Landmark frames ({landmarks.shape[0]}) != video frames ({total_frames})")
-    
-    # Set up output video writer if requested
-    if output_path:
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+    # Create target canvas
+    if transparent:
+        canvas = np.zeros((h, w, 4), dtype=np.uint8)
+        bg_is_rgba = True
     else:
-        out = None
-    
-    frame_count = 0
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            # Get landmarks for this frame
-            if frame_count < len(landmarks):
-                frame_landmarks = landmarks[frame_count]
-                
-                # Extract landmark groups
-                pose_pts = frame_landmarks[:POSE_END]
-                left_hand_pts = frame_landmarks[POSE_END:LEFT_HAND_END]
-                right_hand_pts = frame_landmarks[LEFT_HAND_END:RIGHT_HAND_END]
-                face_pts = frame_landmarks[RIGHT_HAND_END:]
-                
-                # Denormalize landmarks: convert from [0, 1] to pixel coordinates
-                h, w = frame.shape[:2]
-                
-                # Draw pose skeleton
-                pose_px = []
-                for lm in pose_pts:
-                    x = lm[0] * w
-                    y = lm[1] * h
-                    conf = lm[3] if len(lm) > 3 else 1.0  # confidence
-                    pose_px.append((x, y, conf))
-                
-                draw_connections(frame, pose_px, POSE_CONNECTIONS, COLORS['pose'])
-                draw_points(frame, pose_px, COLORS['pose'])
-                
-                # Draw left hand
-                left_hand_px = []
-                for lm in left_hand_pts:
-                    x = lm[0] * w
-                    y = lm[1] * h
-                    conf = lm[3] if len(lm) > 3 else 1.0
-                    left_hand_px.append((x, y, conf))
-                
-                draw_connections(frame, left_hand_px, HAND_CONNECTIONS, COLORS['left_hand'])
-                draw_points(frame, left_hand_px, COLORS['left_hand'])
-                
-                # Draw right hand
-                right_hand_px = []
-                for lm in right_hand_pts:
-                    x = lm[0] * w
-                    y = lm[1] * h
-                    conf = lm[3] if len(lm) > 3 else 1.0
-                    right_hand_px.append((x, y, conf))
-                
-                draw_connections(frame, right_hand_px, HAND_CONNECTIONS, COLORS['right_hand'])
-                draw_points(frame, right_hand_px, COLORS['right_hand'])
-                
-                # Draw face points (no connections, just points)
-                for lm in face_pts:
-                    x = lm[0] * w
-                    y = lm[1] * h
-                    conf = lm[3] if len(lm) > 3 else 1.0
-                    if conf > 0:
-                        cv2.circle(frame, (int(x), int(y)), 1, COLORS['face'], -1)
-            
-            # Add frame counter
-            cv2.putText(
-                frame,
-                f"Frame: {frame_count}/{total_frames}",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 255),
-                2,
-            )
-            
-            # Write frame to output
-            if out:
-                out.write(frame)
-            
-            # Display in window
-            try:
-                cv2.imshow("Landmarks Visualization", frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    break
-            except cv2.error:
-                pass
-            
-            frame_count += 1
-            if frame_count % max(1, total_frames // 10) == 0:
-                print(f"  Processed {frame_count}/{total_frames} frames")
-    
-    finally:
-        cap.release()
-        if out:
-            out.release()
-        cv2.destroyAllWindows()
-        
-        if output_path and Path(output_path).exists():
-            print(f"✓ Visualization saved: {output_path}")
+        canvas_bgr = cv2.resize(img, (w, h)) if scale != 1.0 else img.copy()
+        canvas = canvas_bgr.copy()
+        bg_is_rgba = False
+
+    def to_px(x, y):
+        return (int(np.clip(x, 0.0, 1.0) * (w - 1)), int(np.clip(y, 0.0, 1.0) * (h - 1)))
+
+    # Pose connections (same as before)
+    pose_connections = [
+        (11, 13), (13, 15),
+        (12, 14), (14, 16),
+        (11, 12),
+        (0, 11), (0, 12),
+    ]
+
+    # Line thickness scales with image size
+    thickness = max(1, int(round(2 * scale)))
+
+    # Draw pose
+    for a, b in pose_connections:
+        if a < landmarks.shape[0] and b < landmarks.shape[0]:
+            xa, ya, za, ca = landmarks[a]
+            xb, yb, zb, cb = landmarks[b]
+            if ca > 0.0 and cb > 0.0:
+                pa = to_px(xa, ya)
+                pb = to_px(xb, yb)
+                if bg_is_rgba:
+                    cv2.line(canvas, pa, pb, (0, 255, 0, 255), thickness)
+                else:
+                    cv2.line(canvas, pa, pb, (0, 255, 0), thickness)
+
+    # Hand connections
+    hand_connections = [
+        (0, 1), (1, 2), (2, 3), (3, 4),
+        (0, 5), (5, 6), (6, 7), (7, 8),
+        (0, 9), (9, 10), (10, 11), (11, 12),
+        (0, 13), (13, 14), (14, 15), (15, 16),
+        (0, 17), (17, 18), (18, 19), (19, 20),
+    ]
+
+    left_offset = 17
+    right_offset = 38
+    for a, b in hand_connections:
+        for offset, color in [(left_offset, (255, 0, 0, 255)), (right_offset, (0, 0, 255, 255))]:
+            ia, ib = a + offset, b + offset
+            if ia < landmarks.shape[0] and ib < landmarks.shape[0]:
+                xa, ya, za, ca = landmarks[ia]
+                xb, yb, zb, cb = landmarks[ib]
+                if ca > 0.0 and cb > 0.0:
+                    pa = to_px(xa, ya)
+                    pb = to_px(xb, yb)
+                    if bg_is_rgba:
+                        cv2.line(canvas, pa, pb, color, thickness)
+                    else:
+                        cv2.line(canvas, pa, pb, color[:3], thickness)
+
+    # Face connections (connect groups: mouth, left eye, right eye, eyebrows)
+    if include_face:
+        # mouth 59-70 (12 pts) -> connect in loop
+        mouth_start = 59
+        mouth_len = 12
+        mouth_idxs = list(range(mouth_start, mouth_start + mouth_len))
+        for i in range(len(mouth_idxs)):
+            a = mouth_idxs[i]
+            b = mouth_idxs[(i + 1) % len(mouth_idxs)]
+            if a < landmarks.shape[0] and b < landmarks.shape[0]:
+                xa, ya, za, ca = landmarks[a]
+                xb, yb, zb, cb = landmarks[b]
+                if ca > 0.0 and cb > 0.0:
+                    pa = to_px(xa, ya)
+                    pb = to_px(xb, yb)
+                    color = (0, 255, 255, 255) if bg_is_rgba else (0, 255, 255)
+                    if bg_is_rgba:
+                        cv2.line(canvas, pa, pb, color, thickness)
+                    else:
+                        cv2.line(canvas, pa, pb, color)
+
+        # left eye 71-78 (8 pts)
+        left_eye = list(range(71, 71 + 8))
+        for i in range(len(left_eye)):
+            a = left_eye[i]
+            b = left_eye[(i + 1) % len(left_eye)]
+            if a < landmarks.shape[0] and b < landmarks.shape[0]:
+                xa, ya, za, ca = landmarks[a]
+                xb, yb, zb, cb = landmarks[b]
+                if ca > 0.0 and cb > 0.0:
+                    pa = to_px(xa, ya)
+                    pb = to_px(xb, yb)
+                    color = (0, 200, 200, 255) if bg_is_rgba else (0, 200, 200)
+                    if bg_is_rgba:
+                        cv2.line(canvas, pa, pb, color, thickness)
+                    else:
+                        cv2.line(canvas, pa, pb, color)
+
+        # right eye 79-86 (8 pts)
+        right_eye = list(range(79, 79 + 8))
+        for i in range(len(right_eye)):
+            a = right_eye[i]
+            b = right_eye[(i + 1) % len(right_eye)]
+            if a < landmarks.shape[0] and b < landmarks.shape[0]:
+                xa, ya, za, ca = landmarks[a]
+                xb, yb, zb, cb = landmarks[b]
+                if ca > 0.0 and cb > 0.0:
+                    pa = to_px(xa, ya)
+                    pb = to_px(xb, yb)
+                    color = (0, 200, 200, 255) if bg_is_rgba else (0, 200, 200)
+                    if bg_is_rgba:
+                        cv2.line(canvas, pa, pb, color, thickness)
+                    else:
+                        cv2.line(canvas, pa, pb, color)
+
+        # eyebrows: left 88-90 (3 pts), right 91-93 (3 pts) -> connect sequentially
+        left_eyebrow = list(range(88, 88 + 3))
+        right_eyebrow = list(range(91, 91 + 3))
+        for group in (left_eyebrow, right_eyebrow):
+            for i in range(len(group) - 1):
+                a = group[i]
+                b = group[i + 1]
+                if a < landmarks.shape[0] and b < landmarks.shape[0]:
+                    xa, ya, za, ca = landmarks[a]
+                    xb, yb, zb, cb = landmarks[b]
+                    if ca > 0.0 and cb > 0.0:
+                        pa = to_px(xa, ya)
+                        pb = to_px(xb, yb)
+                        color = (200, 200, 0, 255) if bg_is_rgba else (200, 200, 0)
+                        if bg_is_rgba:
+                            cv2.line(canvas, pa, pb, color, thickness)
+                        else:
+                            cv2.line(canvas, pa, pb, color)
+
+        # nose tip (87) as a small circle
+        if 87 < landmarks.shape[0]:
+            xn, yn, zn, cn = landmarks[87]
+            if cn > 0.0:
+                pn = to_px(xn, yn)
+                if bg_is_rgba:
+                    cv2.circle(canvas, pn, max(1, thickness), (0, 255, 255, 255), -1)
+                else:
+                    cv2.circle(canvas, pn, max(1, thickness), (0, 255, 255), -1)
+
+    # Save
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Ensure PNG if transparent requested
+    if transparent and bg_is_rgba:
+        cv2.imwrite(str(out_path), canvas)
+    else:
+        # If we produced RGBA but transparent=False, convert to BGR
+        if canvas.shape[2] == 4:
+            canvas_bgr = cv2.cvtColor(canvas, cv2.COLOR_BGRA2BGR)
+            cv2.imwrite(str(out_path), canvas_bgr)
+        else:
+            cv2.imwrite(str(out_path), canvas)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Visualize landmarks from .npy files on video"
-    )
-    parser.add_argument(
-        "video",
-        nargs="?",
-        help="Video file path (optional, uses first video in dataset/segmented/ if not provided)"
-    )
-    parser.add_argument(
-        "--landmarks",
-        help="Landmarks .npy file path (auto-detected if not provided)"
-    )
-    parser.add_argument(
-        "--output",
-        help="Output video path (optional, displays in window if not provided)"
-    )
-    
+    parser = argparse.ArgumentParser(description="Visualize holistic landmarks on one image")
+    parser.add_argument("--image", type=str, help="Path to an image file (png/jpg)")
+    parser.add_argument("--split", type=str, choices=["train", "dev", "test"], default="dev", help="Dataset split to pick an example from")
+    parser.add_argument("--model-path", type=str, default=None, help="Path to holistic_landmarker.task model file")
+    parser.add_argument("--output", type=str, default=None, help="Output overlay image path")
+    parser.add_argument("--no-ids", action="store_true", help="Do not draw landmark id labels on overlay")
+    parser.add_argument("--skeleton", action="store_true", help="Also save an additional skeleton-only image (pose+hands)")
+    parser.add_argument("--skeleton-output", type=str, default=None, help="Path for skeleton-only output image")
+    parser.add_argument("--full-skeleton", action="store_true", help="Include face landmarks in the skeleton output")
+    parser.add_argument("--transparent", action="store_true", help="When creating skeleton-only output, produce a transparent PNG")
+    parser.add_argument("--scale", type=float, default=1.0, help="Scale factor for output images (e.g., 2.0 for double resolution)")
+    parser.add_argument("--transparent-output", type=str, default=None, help="Path for transparent skeleton output image (PNG)")
     args = parser.parse_args()
-    
-    # Find video to process
-    if args.video:
-        video_path = find_video_file(args.video)
-        if not video_path:
-            print(f"ERROR: Cannot find video: {args.video}")
-            return
+
+    repo_root = Path(__file__).resolve().parent.parent
+
+    if args.image:
+        image_path = Path(args.image)
     else:
-        # Use first video in dataset/segmented/
-        root_dir = Path(__file__).parent.parent
-        video_dir = root_dir / "dataset" / "segmented"
-        videos = sorted(video_dir.glob("*.mp4"))
-        if not videos:
-            print("ERROR: No videos found in dataset/segmented/")
-            return
-        video_path = videos[0]
-        print(f"Using first video: {video_path.name}")
-    
-    # Find landmarks file
-    if args.landmarks:
-        landmarks_path = Path(args.landmarks)
-    else:
-        landmarks_path = find_landmarks_file(video_path)
-        if not landmarks_path:
-            print(f"ERROR: Cannot find landmarks file for {video_path.name}")
-            return
-    
-    print(f"Using landmarks: {landmarks_path.name}")
-    
-    # Set output path
-    if args.output:
-        output_path = args.output
-    else:
-        output_path = video_path.parent / f"{video_path.stem}_landmarks_viz.mp4"
-    
-    # Visualize
-    visualize_from_npy(video_path, landmarks_path, output_path)
+        image_path = pick_example_image(repo_root, args.split)
+        if image_path is None:
+            print("No example image found in dataset; provide --image")
+            sys.exit(1)
+
+    LandmarkExtractor = load_landmark_extractor_module(repo_root)
+    extractor = LandmarkExtractor(model_path=args.model_path)
+    try:
+        lm = extractor.extract_landmarks_from_image(image_path)
+    finally:
+        extractor.close()
+
+    if lm is None:
+        print(f"No landmarks extracted for {image_path}")
+        sys.exit(1)
+
+    out_path = Path(args.output) if args.output else repo_root / "outputs" / "visualized_landmarks" / (image_path.stem + "_landmarks.png")
+    draw_landmarks_overlay(image_path, lm, out_path, draw_ids=(not args.no_ids), draw_points=True)
+    print(f"Saved overlay to: {out_path}")
+
+    if args.skeleton:
+        sk_out = Path(args.skeleton_output) if args.skeleton_output else repo_root / "outputs" / "visualized_landmarks" / (image_path.stem + "_skeleton.png")
+        if args.scale != 1.0 or args.full_skeleton or args.transparent:
+            # use full renderer for scaling/face/transparent options
+            draw_full_skeleton_overlay(image_path, lm, sk_out, include_face=args.full_skeleton, transparent=args.transparent, scale=args.scale)
+        else:
+            draw_skeleton_overlay(image_path, lm, sk_out)
+        print(f"Saved skeleton to: {sk_out}")
+
+    if args.transparent and not args.skeleton:
+        # If user asked for transparent but not skeleton, still allow generating a transparent full-skeleton image
+        t_out = Path(args.transparent_output) if args.transparent_output else repo_root / "outputs" / "visualized_landmarks" / (image_path.stem + "_skeleton_transparent.png")
+        draw_full_skeleton_overlay(image_path, lm, t_out, include_face=args.full_skeleton, transparent=True, scale=args.scale)
+        print(f"Saved transparent skeleton to: {t_out}")
 
 
 if __name__ == "__main__":
